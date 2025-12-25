@@ -1,0 +1,36 @@
+
+[] commands
+[] channels with membership/ownership (Currently all global)
+
+Channel commands
+/c|chan|channel
+
+public channels auto joined
+
+global
+
+
+new|make|create <name> -> name is optional but makes a new channel with you as the owner
+public -> makes the current channel public if you are the owner of it (anyone can join)
+private -> makes the current channel private if you are the owner of it (invite only)
+invite <user> -> invites the user to the channel if it is private (shows error if public)
+uninvite <user> -> revokes a users invite to the channel
+join <channel> -> joins the channel if it is public or you are invited
+kick <user> -> kicks the user from the channel if your the owner
+ban <user> -> bans he user from the channel (only works if the channel is public)
+delete -> deletes the channel if your the owner
+banner <text> changes the banner of the channel
+readonly toggles whether the channel is read only
+
+change user's channels
+ -> update DB channels
+ -> update channels on the users screen
+ -> update member list on anyone in the channel's screen (Members list shows online users then offline users )
+ 
+We can store a list of online users for each channel
+Only show offline users in private channels
+
+
+[] dates show with full date when its >= 24h ago
+[x] sign up/sign in (Just username/pass for now)
+[] nicer flow/ux like using arrows and hjjkl as well as tab to focus different boxes

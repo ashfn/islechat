@@ -14,6 +14,7 @@ import (
 	// "strings"
 	"syscall"
 	"time"
+	"sync"
 
 	"github.com/charmbracelet/bubbles/cursor"
 	"github.com/charmbracelet/bubbles/textarea"
@@ -50,18 +51,40 @@ const (
 // app contains a wish server and the list of running programs.
 type app struct {
 	*ssh.Server
-    progs map[string]*tea.Program
+    // progs map[string]*tea.Program
 	db *gorm.DB 
-	messages map[string]*[]chatMsg
+	messages map[string][]chatMsg
 
-	// Only stores in logged in users to prevent the same user logging in from multiple shells 
+	// Only stores logged in users to prevent the same user logging in from multiple shells 
 	// Map from username -> session
 	// will also include 
 	sessions map[string]*userSession
 
+	mu sync.RWMutex
+
 	// Map from channel ids to channel object
 	channels map[string]*Channel
-	channelOnlineMembers map[string]*[]*userSession
+	// Only the online members!
+	channelMembers map[string]map[string]*userSession
+
+	// Map between session ids and logged-in usernames
+	// Used for handling session disconnects
+	// If the user isn't logged in the username will be nil
+	sessionUsernames map[string]string
+}
+
+
+// A session for a user
+type userSession struct {
+
+	prog *tea.Program
+	loggedIn bool
+
+	// Used so we dont distribute the message to absolutely everyone
+	// Will be nil if not logged in
+	username string
+	currentChannelId string
+
 }
 
 type User struct {
@@ -98,19 +121,6 @@ type Channel struct {
 	ReadOnly bool
 }
 
-
-
-
-// A session for a LOGGED IN user
-type userSession struct {
-
-	prog *tea.Program
-	// Used so we dont distribute the message to absolutely everyone
-	username string
-	currentChannelId string
-
-}
-
 func HashPassword(password string) (string, error) {
     bytes, err := bcrypt.GenerateFromPassword([]byte(password), 10)
     return string(bytes), err
@@ -131,25 +141,32 @@ func (a *app) sendMessage(msg chatMsg) {
 		Time: msg.time,
 		ChannelID: msg.channel,
 	})
-	*a.messages[msg.channel] = append(*a.messages[msg.channel], msg)
+	a.messages[msg.channel] = append(a.messages[msg.channel], msg)
 	if(err==nil){
-		for _, p := range a.progs {
-			go p.Send(msg)
+		a.mu.Lock()
+		for _, p := range a.sessions {
+			if(p.currentChannelId==msg.channel){
+				go p.prog.Send(msg)
+			}
 		}
+		a.mu.Unlock()
 	}else{
 		// Handle error or some shit
 	}
 }
 
 func (a *app) updateUserlists() {
-	users := make([]string, len(a.progs))
+
+	// TEMPORARY USER LIST
+
+	users := make([]string, len(a.sessions))
 	i := 0
-	for k := range a.progs {
-		users[i] = k
+	for u, _ := range a.sessions {
+		users[i] = u
 		i++
 	}
-	for _, p := range a.progs {
-		go p.Send(userlist(users))
+	for _, sess := range a.sessions {
+		go sess.prog.Send(userlist(users))
 	}
 }
 
@@ -188,15 +205,18 @@ func newApp(db *gorm.DB) *app {
 
 	// a.glamourRenderer = r
 
-	a.messages = make(map[string]*[]chatMsg)
+	a.messages = make(map[string][]chatMsg)
 	a.channels = make(map[string]*Channel)
+	a.channelMembers = make(map[string]map[string]*userSession)
+
 
 	channels, err := gorm.G[Channel](db).Find(context.Background())
 
 	for _,v := range channels{
 		temp := make([]chatMsg, 0)
-		a.messages[v.ID] = &temp
+		a.messages[v.ID] = temp
 		a.channels[v.ID] = &v
+		a.channelMembers[v.ID] = make(map[string]*userSession)
 	}
 
 	var msgs []Message
@@ -214,7 +234,7 @@ func newApp(db *gorm.DB) *app {
 	slices.Reverse(msgs)
 
 	for _,v := range msgs {
-		*a.messages[v.ChannelID] = append(*a.messages[v.ChannelID], chatMsg{
+		a.messages[v.ChannelID] = append(a.messages[v.ChannelID], chatMsg{
 			sender: v.SenderID,
 			text: v.Content,
 			time: v.Time,
@@ -222,22 +242,29 @@ func newApp(db *gorm.DB) *app {
 		})
 	}
 
-	a.progs = make(map[string]*tea.Program)
+	a.sessions = make(map[string]*userSession)
 	s, err := wish.NewServer(
 		wish.WithAddress(net.JoinHostPort(host, port)),
 		wish.WithHostKeyPath(".ssh/id_ed25519"),
 		wish.WithPasswordAuth(func(ctx ssh.Context, password string) bool {
 			username := ctx.User()
 
+
+
 			user, err := gorm.G[User](db).
 				Where("ID = ?", username).
 				First(context.Background())
+
+
 
 			if(err==nil){
 				// We found the user
 				// check password
 				if(VerifyPassword(password, user.Password)){
 					// Password was correct, we are good to go
+					
+
+
 					ctx.SetValue("auth_status", "ok")
 					return true
 				}else{
@@ -262,7 +289,9 @@ func newApp(db *gorm.DB) *app {
 					// sess.Context().
 				}
 			},
+			a.CleanupMiddleware,
 			bubbletea.MiddlewareWithProgramHandler(a.ProgramHandler, termenv.ANSI256),
+
 			activeterm.Middleware(),
 			logging.Middleware(),
 		),
@@ -295,6 +324,15 @@ func (a *app) Start() {
 		log.Error("Could not stop server", "error", err)
 	}
 }
+func (a *app) CleanupMiddleware(next ssh.Handler) ssh.Handler {
+    return func(s ssh.Session) {
+		defer func() {
+			// The s.User() cannot be used here at all because someone can obviously be signing up 
+			log.Error(fmt.Sprintf("User left: %s", s.User()))
+        }()
+	}
+}
+
 
 func (a *app) ProgramHandler(s ssh.Session) *tea.Program {
 
@@ -302,17 +340,47 @@ func (a *app) ProgramHandler(s ssh.Session) *tea.Program {
 
 	model := initialModel(a, 120, 30, s)
 	model.app = a
-	model.viewChatModel.id = s.User()
+
+	// Only fetch channels if theyre actually authed
+
 
 	updateChatLines(&model)
 	updateChannelList(&model)
 	updateRegistrationTextFocuses(&model)
 
-	//tea.WithMouseAllMotion()
-	// tea.WithMouseCellMotion()
+	
     opts := append([]tea.ProgramOption{}, bubbletea.MakeOptions(s)...)
     p := tea.NewProgram(model, opts...)
-	a.progs[s.User()] = p
+
+
+	if(s.Context().Value("auth_status")=="ok"){
+
+		// Add session to db
+		a.mu.Lock()
+		a.sessions[s.User()]=&userSession{
+			prog: p,
+			loggedIn: true,
+			username: s.User(),
+			currentChannelId: "global",
+		}
+		a.mu.Unlock()
+		go joinedHandleChannels(&model)
+	}else{
+		// We give it a temporary 'username' using the session id
+		log.Info(fmt.Sprintf("Sessid: %s", s.Context().SessionID()))
+		a.mu.Lock()
+		a.sessions[s.Context().SessionID()]=&userSession{
+			prog: p,
+			loggedIn: false,
+			username: "",
+			currentChannelId: "",
+		}
+		a.mu.Unlock()
+	}
+
+	// a
+
+
 	a.updateUserlists()
 
 	return p
@@ -402,7 +470,7 @@ type viewChatModel struct {
 	senderStyle lipgloss.Style
 	dateStyle lipgloss.Style
 	err         error
-	users userlist
+	memberList memberList
 	focus FocusedBox
 	windowHeight int
 	windowWidth int
@@ -452,6 +520,54 @@ func centerString(str string, width int) string {
 	spaces := int(float64(width-len(str)) / 2)
 	return strings.Repeat(" ", spaces) + str + strings.Repeat(" ", width-(spaces+len(str)))
 }
+
+
+
+// For only when a user joins the main area (From logging in or just signing up)
+func joinedHandleChannels(m *model) {
+	// Update the users channel list from the DB
+	// Update the user list for everyone in their channels
+
+	m.viewChatModel.channels = make([]userChannelState, 0)
+
+	var channelIDs []string
+
+	// We query the join table specifically to get the IDs for this User
+	err := m.app.db.Table("user_channels").
+		Where("user_id = ?", m.viewChatModel.id).
+		Pluck("channel_id", &channelIDs).Error
+
+	if(err!=nil){
+		// That would be really weird if we ended up here
+		log.Error("Error was NOT NIL!")
+		log.Error(err)
+		return
+	}
+
+	// Adding the channels for the user
+	for _, channel := range channelIDs {
+
+		m.viewChatModel.channels = append(m.viewChatModel.channels, userChannelState{
+			channelId: channel,
+			unread: 0,
+		})
+	}
+
+	// Adding the user to online member list for their channels
+	m.app.mu.Lock()
+	for _, channel := range channelIDs {
+		log.Info(fmt.Sprintf("Chan: %s, id: %s", channel, m.viewChatModel.id))
+		m.app.channelMembers[channel][m.viewChatModel.id]=m.app.sessions[m.viewChatModel.id]
+	}
+	m.app.mu.Unlock()
+
+	for _, channel := range channelIDs {
+		updateChannelMemberList(m, channel)
+	}
+
+}
+
+
 func initialModel(a *app, width int, height int, sess ssh.Session) model {
 
 	ta := textarea.New()
@@ -476,7 +592,7 @@ func initialModel(a *app, width int, height int, sess ssh.Session) model {
 
 	ta.KeyMap.InsertNewline.SetEnabled(false)
 
-	previousMsgs := *a.messages["global"]
+	previousMsgs := a.messages["global"]
 
 	// previousMsgs := []chatMsg{}
 	// msgs,err := gorm.G[Message](a.db).
@@ -535,6 +651,8 @@ func initialModel(a *app, width int, height int, sess ssh.Session) model {
 	feedbackViewport.SetContent("")
 
 	if(sess.Context().Value("auth_status")=="ok"){
+
+		// Add session to db
 		return model{
 
 			viewMode: viewChat,
@@ -551,7 +669,7 @@ func initialModel(a *app, width int, height int, sess ssh.Session) model {
 				currentChannel: 0,
 				channels: channelList,
 				err:         nil,
-				users: make([]string, 0),
+				memberList: make([]*userSession, 0),
 				focus: FocusedBoxChatInput,	
 			},
 			viewRegistrationModel: viewRegistrationModel{
@@ -568,11 +686,13 @@ func initialModel(a *app, width int, height int, sess ssh.Session) model {
 			passwordInput.SetValue(pass)
 		}
 
+		log.Info(fmt.Sprintf("Sessid: %s", sess.Context().SessionID()))
+		
 		return model{
 
 			viewMode: viewRegistration,
-
 			viewChatModel: viewChatModel{
+				id: sess.Context().SessionID(),
 				textarea:    ta,
 				messages:    previousMsgs,
 				messageHistoryViewport:    mvp,
@@ -583,7 +703,7 @@ func initialModel(a *app, width int, height int, sess ssh.Session) model {
 				currentChannel: 0,
 				channels: channelList,
 				err:         nil,
-				users: make([]string, 0),
+				memberList: make([]*userSession, 0),
 				focus: FocusedBoxChatInput,
 			},
 			viewRegistrationModel: viewRegistrationModel{
@@ -619,9 +739,10 @@ func simpleMarkdown(text string) string {
 
 func updateUserList(m *model){
 	userListText := ""
-	for _, v := range m.viewChatModel.users {
-		userListText+=fmt.Sprintf("@%s", v)+"\n"
+	for _, v := range m.viewChatModel.memberList {
+		userListText+= fmt.Sprintf("@%s", v.username)+"\n"
 	}
+	//lipgloss.NewStyle().Foreground(lipgloss.Color("77")).Render(
 	m.viewChatModel.userListViewport.SetContent(userListText)
 }
 
@@ -687,7 +808,7 @@ func updateChatLines(m *model) {
 }
 
 func reloadMessagesChannelSwitch(m *model){
-	m.viewChatModel.messages = *m.app.messages[m.viewChatModel.channels[m.viewChatModel.currentChannel].channelId]
+	m.viewChatModel.messages = m.app.messages[m.viewChatModel.channels[m.viewChatModel.currentChannel].channelId]
 	updateChatLines(m)
 }
 
@@ -712,6 +833,49 @@ func updateRegistrationTextFocuses(m *model){
 	}
 }
 
+type memberList []*userSession
+
+func updateChannelMemberList(m *model, channelId string){
+	m.app.mu.RLock()
+	members := make([]*userSession, 0, len(m.app.channelMembers[channelId]))
+	for _,v := range m.app.channelMembers[channelId]{
+		if((*v).loggedIn){
+			members = append(members, v)
+		}
+	}
+	m.app.mu.RUnlock()
+	for _,v := range members{
+		go (*v).prog.Send(memberList(members))
+	}
+}
+
+func userLeft(m *model){
+
+	if(m.viewMode==viewChat){
+		// Also need to add update stuff but can do that later
+		log.Error("Left")
+		m.app.mu.Lock()
+		for _,v := range m.viewChatModel.channels{
+			delete(m.app.channelMembers[v.channelId], m.viewChatModel.id)
+		}
+		// m.viewChatModel.channels
+		delete(m.app.sessions, m.viewChatModel.id)
+		m.app.mu.Unlock()
+		for _,v := range m.viewChatModel.channels{
+			updateChannelMemberList(m, v.channelId)
+		}
+
+	}else{
+
+		m.app.mu.Lock()
+		delete(m.app.sessions, m.viewChatModel.id)
+		m.app.mu.Unlock()
+
+		// We dont need to handle updating user lists or anything as they aren't registered
+	}
+
+}
+
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var (
 			tiCmd tea.Cmd
@@ -731,8 +895,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 				switch msg.Type {
 				case tea.KeyCtrlC, tea.KeyEsc:
-					delete(m.app.progs, m.viewChatModel.id)
-					m.app.updateUserlists()
+					// Need generic method for when a user left
+					userLeft(&m)
 					return m, tea.Quit
 				case tea.KeyEnter:
 					if m.viewChatModel.textarea.Value() != "" {
@@ -853,13 +1017,16 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.viewChatModel.channels = msg
 				updateChannelList(&m)
 			
-			case userlist:
-				m.viewChatModel.users = msg
+			case memberList:
+				log.Info("Received member list!")
+				m.viewChatModel.memberList = msg
 				updateUserList(&m)
 			
 			case tea.QuitMsg:
-				delete(m.app.progs, m.viewChatModel.id)
-				m.app.updateUserlists()
+				userLeft(&m)
+				// User left
+				// delete(m.app.progs, m.viewChatModel.id)
+				// m.app.updateUserlists()
 
 			case errMsg:
 				m.viewChatModel.err = msg
@@ -874,8 +1041,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 			case tea.KeyMsg:
 				if(msg.Type == tea.KeyCtrlC || msg.Type==tea.KeyEsc){
-					delete(m.app.progs, m.viewChatModel.id)
-					m.app.updateUserlists()
+					// User left
+					// delete(m.app.progs, m.viewChatModel.id)
+					// m.app.updateUserlists()
+					userLeft(&m)
 					return m, tea.Quit
 				}
 				if(msg.Type == tea.KeyEnter || msg.Type == tea.KeyTab || msg.Type == tea.KeyDown){
@@ -911,7 +1080,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 							err = gorm.G[User](m.db).Create(context.Background(), &User{
 								ID: newUsername,
 								Password: hashedPass,
-								Channels: []Channel{*m.channels["global"]},
+								Channels: []Channel{*m.app.channels["global"]},
 							})
 
 							if(err!=nil){
@@ -919,7 +1088,22 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 								m.viewRegistrationModel.feedbackViewport.SetContent("Username already exists")
 								return m,nil
 							}else{
-								// Account was created?
+
+								// delete old session create new session
+								log.Info(fmt.Sprintf("id: %s", m.viewChatModel.id))
+								m.app.mu.Lock()
+								prog := m.app.sessions[m.viewChatModel.id].prog
+								delete(m.app.sessions, m.viewChatModel.id)
+								m.app.sessions[newUsername]=&userSession{
+									prog: prog,
+									loggedIn: true,
+									username: newUsername,
+									currentChannelId: "global",
+								}
+								m.app.mu.Unlock()
+								m.viewChatModel.id = newUsername
+
+								// Account was created
 								m.viewMode=viewChat
 
 							}
@@ -943,8 +1127,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 				updateRegistrationTextFocuses(&m)
 			case tea.QuitMsg:
-				delete(m.app.progs, m.viewChatModel.id)
-				m.app.updateUserlists()
+				// delete(m.app.progs, m.viewChatModel.id)
+				// m.app.updateUserlists()
+				userLeft(&m)
 			case tea.WindowSizeMsg:
 				// m.windowHeight = msg.Height
 				// m.windowWidth = msg.Width
@@ -980,7 +1165,7 @@ func getFullUserListBar(m model) string {
 ⠀⢀⣄⣶⣿⣿⣟⣻⣻⣯⣕⣒⣄⡀  `
 	bannerStyle := lipgloss.NewStyle().Background(lipgloss.Color("235")).Foreground(lipgloss.Color("15"))
 
-	return bannerStyle.Render(banner)+ "\n"+ fmt.Sprintf("%s users online\n", humanize.Comma(int64(len(m.viewChatModel.users)))) + 
+	return bannerStyle.Render(banner)+ "\n"+ fmt.Sprintf("%s users online\n", humanize.Comma(int64(len(m.viewChatModel.memberList)))) + 
 	 m.viewChatModel.userListViewport.View()
 }
 
@@ -1124,8 +1309,6 @@ func (m model) View() string {
 				Foreground(lipgloss.Color("121"))
 
 			titleRegBox := RegistrationBox()
-
-			
 
 			return lipgloss.JoinVertical(lipgloss.Right, 
 				titleRegBox.Render("username", usernameBox, 26, m.viewRegistrationModel.FocusedBox==RegistrationUsernameFocused),

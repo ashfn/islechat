@@ -34,3 +34,4 @@ Only show offline users in private channels
 [] dates show with full date when its >= 24h ago
 [x] sign up/sign in (Just username/pass for now)
 [] nicer flow/ux like using arrows and hjjkl as well as tab to focus different boxes
+[] mentions with @ and notifications (special for mention otherwise just white instead of gray)

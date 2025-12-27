@@ -13,9 +13,9 @@ import (
 
 	"unicode"
 	// "strings"
+	"sync"
 	"syscall"
 	"time"
-	"sync"
 
 	"github.com/charmbracelet/bubbles/cursor"
 	"github.com/charmbracelet/bubbles/textarea"
@@ -30,6 +30,9 @@ import (
 	"github.com/charmbracelet/wish/bubbletea"
 	"github.com/charmbracelet/wish/logging"
 	"github.com/muesli/termenv"
+
+    "go.dalton.dog/bubbleup"
+
 
 	// "github.com/charmbracelet/glamour"
 
@@ -66,7 +69,10 @@ type app struct {
 	// Map from channel ids to channel object
 	channels map[string]*Channel
 	// Only the online members!
-	channelMembers map[string]map[string]*userSession
+	// channelMembers map[string]map[string]*userSession
+
+	// Cached channel memberlists
+	channelMemberListCache map[string]*channelMemberList
 
 	// Map between session ids and logged-in usernames
 	// Used for handling session disconnects
@@ -107,11 +113,10 @@ type Message struct {
 }
 
 type Invite struct {
-	gorm.Model
 	User User
-	UserID string
+	UserID string `gorm:"primaryKey"`
 	Channel Channel
-	ChannelID string
+	ChannelID string `gorm:"primaryKey"`
 }
 
 type Channel struct {
@@ -121,6 +126,7 @@ type Channel struct {
 	Banner string
 	Public bool
 	ReadOnly bool
+	Users []User `gorm:"many2many:user_channels;"`
 }
 
 func HashPassword(password string) (string, error) {
@@ -206,21 +212,46 @@ func newApp(db *gorm.DB) *app {
 	// }
 
 	// a.glamourRenderer = r
-
+	a.mu.Lock()
 	a.messages = make(map[string][]chatMsg)
 	a.channels = make(map[string]*Channel)
-	a.channelMembers = make(map[string]map[string]*userSession)
+	// a.channelMembers = make(map[string]map[string]*userSession)
 	a.sessionUsernames = make(map[string]string)
+	a.channelMemberListCache = make(map[string]*channelMemberList)
 
 
-	channels, err := gorm.G[Channel](db).Find(context.Background())
+	// channels, err := gorm.G[Channel](db).Find(context.Background())
+	var channels []Channel
+	err := db.Preload("Users", func(db *gorm.DB) *gorm.DB {
+		return db.Select("id")
+	}).Find(&channels).Error
+
+	if err != nil {
+		log.Errorf("Error fetching channels: %v", err)
+	}
 
 	for _,v := range channels{
 		temp := make([]chatMsg, 0)
 		a.messages[v.ID] = temp
 		a.channels[v.ID] = &v
-		a.channelMembers[v.ID] = make(map[string]*userSession)
+		// a.channelMembers[v.ID] = make(map[string]*userSession)
+
+		a.channelMemberListCache[v.ID] = &channelMemberList{
+			onlineMembers: make(map[string]*userSession),
+			publicChannel: v.Public,
+			offlineMembers: make(map[string]string),
+			offlineMemberCount: len(v.Users),
+		}
+		if(!v.Public){
+			for _,u := range v.Users {
+				a.channelMemberListCache[v.ID].offlineMembers[u.ID]=u.ID
+			}
+		}
+		log.Infof("===== %s =====", v.ID)
+		log.Info(a.channelMemberListCache[v.ID].offlineMembers)
 	}
+
+
 
 	var msgs []Message
 	db.Raw(`
@@ -242,10 +273,13 @@ func newApp(db *gorm.DB) *app {
 			text: v.Content,
 			time: v.Time,
 			channel: v.ChannelID,
-		})
+		}) 
 	}
 
 	a.sessions = make(map[string]*userSession)
+
+	a.mu.Unlock()
+
 	s, err := wish.NewServer(
 		wish.WithAddress(net.JoinHostPort(host, port)),
 		wish.WithHostKeyPath(".ssh/id_ed25519"),
@@ -343,14 +377,22 @@ func (a *app) CleanupMiddleware(next ssh.Handler) ssh.Handler {
 				a.mu.Unlock()
 			}else{
 				log.Error(fmt.Sprintf("Logged in user left: %s", username))
-				a.mu.Lock()
-				for _,v := range a.sessions[username].joinedChannels{
-					delete(a.channelMembers[v], username)
-				}
-				a.mu.Unlock()
-				for _,v := range a.sessions[username].joinedChannels{
-					updateChannelMemberList(a, v)
-				}
+
+				// Update channel list for all their channels
+				updateChannelMemberList(updateChannelMemberListParameters{
+					app: a,
+					userId: username,
+					change: UserChannelOffline,
+				})
+
+				// a.mu.Lock()
+				// for _,v := range a.sessions[username].joinedChannels{
+				// 	delete(a.channelMembers[v], username)
+				// }
+				// a.mu.Unlock()
+				// for _,v := range a.sessions[username].joinedChannels{
+				// 	updateChannelMemberList(a, v)
+				// }
 				a.mu.Lock()
 				delete(a.sessions, username)
 				a.mu.Unlock()
@@ -500,10 +542,11 @@ type viewChatModel struct {
 	senderStyle lipgloss.Style
 	dateStyle lipgloss.Style
 	err         error
-	memberList memberList
+	memberList *channelMemberList
 	focus FocusedBox
 	windowHeight int
 	windowWidth int
+	alert   bubbleup.AlertModel
 }
 
 type model struct {
@@ -595,15 +638,18 @@ func joinedHandleChannels(m *model) []userChannelState  {
 	m.app.mu.Lock()
 	for _, channel := range channelIDs {
 		log.Info(fmt.Sprintf("Chan: %s, id: %s", channel, m.viewChatModel.id))
-		m.app.channelMembers[channel][m.viewChatModel.id]=m.app.sessions[m.viewChatModel.id]
+		// m.app.channelMembers[channel][m.viewChatModel.id]=m.app.sessions[m.viewChatModel.id]
 		m.app.sessions[m.viewChatModel.id].joinedChannels = append(m.app.sessions[m.viewChatModel.id].joinedChannels, channel)
 	}
 	
 	m.app.mu.Unlock()
 
-	for _, channel := range channelIDs {
-		updateChannelMemberList(m.app, channel)
-	}
+	updateChannelMemberList(updateChannelMemberListParameters{
+		app: m.app,
+		userId: m.viewChatModel.id,
+		change: UserChannelOnline,
+	})
+
 	return channels
 }
 
@@ -720,8 +766,9 @@ func initialModel(a *app, width int, height int, sess ssh.Session) model {
 								⠀⠀⠀⠀⠀⠀⣀⣿⡇⠀⠀⠀⠀⠀ 
 								⠀⢀⣄⣶⣿⣿⣟⣻⣻⣯⣕⣒⣄⡀  `,
 				err:         nil,
-				memberList: make([]*userSession, 0),
+				memberList: a.channelMemberListCache["global"],
 				focus: FocusedBoxChatInput,	
+				alert: *bubbleup.NewAlertModel(40, false, 2),
 			},
 			viewRegistrationModel: viewRegistrationModel{
 				usernameInput: usernameInput,
@@ -763,8 +810,10 @@ func initialModel(a *app, width int, height int, sess ssh.Session) model {
 								⠀⠀⠀⠀⠀⠀⠀⣾⡇⠀loading..
 								⠀⠀⠀⠀⠀⠀⣀⣿⡇⠀⠀⠀⠀⠀ 
 								⠀⢀⣄⣶⣿⣿⣟⣻⣻⣯⣕⣒⣄⡀  `,
-				memberList: make([]*userSession, 0),
+				memberList: a.channelMemberListCache["global"],
 				focus: FocusedBoxChatInput,
+				alert: *bubbleup.NewAlertModel(40, false, 2),
+
 			},
 			viewRegistrationModel: viewRegistrationModel{
 				FocusedBox: RegistrationPasswordConfirmFocused,
@@ -782,7 +831,7 @@ func initialModel(a *app, width int, height int, sess ssh.Session) model {
 
 func (m model) Init() tea.Cmd {
 	// return textarea.Blink
-	return nil
+	return m.viewChatModel.alert.Init()
 }
 var (
     boldRegex   = regexp.MustCompile(`\*\*(.+?)\*\*`)
@@ -798,12 +847,23 @@ func simpleMarkdown(text string) string {
 }
 
 func updateUserList(m *model){
-	userListText := ""
-	for _, v := range m.viewChatModel.memberList {
-		userListText+= fmt.Sprintf("@%s", v.username)+"\n"
-	}
-	//lipgloss.NewStyle().Foreground(lipgloss.Color("77")).Render(
-	m.viewChatModel.userListViewport.SetContent(userListText)
+	var content strings.Builder
+    
+    onlineStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("10"))
+	offlineStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("240"))
+
+
+    for _, v := range m.viewChatModel.memberList.onlineMembers {
+        line := fmt.Sprintf("@%s", v.username)
+        content.WriteString(onlineStyle.Render(line) + "\n")
+    }
+
+    for _, v := range m.viewChatModel.memberList.offlineMembers {
+        line := fmt.Sprintf("@%s", v)
+        content.WriteString(offlineStyle.Render(line) + "\n")
+    }
+
+    m.viewChatModel.userListViewport.SetContent(content.String())
 }
 
 func updateChannelList(m *model){
@@ -898,10 +958,12 @@ func addUserToChannel(app *app, user string, channel string) bool {
 
 	app.mu.Lock()
 	app.sessions[user].joinedChannels = append(app.sessions[user].joinedChannels, channel)
-	app.channelMembers[channel][user]=app.sessions[user]
+	// app.channelMembers[channel][user]=app.sessions[user]
 	app.mu.Unlock()
 	
-	updateChannelMemberList(app, channel)
+
+
+	// updateChannelMemberList(app, channel)
 
 	// Update the user's channel list
 
@@ -933,21 +995,112 @@ func updateRegistrationTextFocuses(m *model){
 type memberList []*userSession
 
 type channelMemberList struct {
-	onlineMembers []*userSession
-	
+	// Store user lists as a map for O(1) insert/remove
+	// user id -> user session
+	onlineMembers map[string]*userSession
+	// This will be empty if the channel is public as 
+	// public channels won't list offline members, they 
+	// will just display the count
+	publicChannel bool
+	offlineMembers map[string]string
+	offlineMemberCount int
+
 }
 
-func updateChannelMemberList(app *app, channelId string){
-	app.mu.RLock()
-	members := make([]*userSession, 0, len(app.channelMembers[channelId]))
-	for _,v := range app.channelMembers[channelId]{
-		if((*v).loggedIn){
-			members = append(members, v)
-		}
+type channelMemberListMsg *channelMemberList
+
+// times the user list needs to be updated
+// [] user joined from login
+//  -> update all the channels theyre in
+// [] user joined from registration
+//  -> update the general channel
+// [] user joined channel
+//  -> only update that channel
+// [] user left channel
+//  -> only update that channel
+// [] user disconnected
+//  -> update all the channels theyre in
+
+type UserChannelDelta int
+
+const (
+	UserChannelJoin UserChannelDelta = iota
+	UserChannnelLeave
+	UserChannelOffline
+	UserChannelOnline
+)
+
+
+type updateChannelMemberListParameters struct {
+	app *app
+	userId string
+	change UserChannelDelta
+	channelId string
+}
+
+
+
+// The sole purpose of this is pushing the channel member list changes to 
+// anyone in those channels, it doesnt handle the other state stuff
+func updateChannelMemberList(params updateChannelMemberListParameters){
+	if(params.app==nil || params.userId==""){
+		// invalid
+		log.Error("Invalid update channel member list call")
+		return
 	}
-	app.mu.RUnlock()
-	for _,v := range members{
-		go (*v).prog.Send(memberList(members))
+
+	// If no channel was provided we will do it for all their channels
+	if(params.channelId==""){
+		// Basically need to do the same as below but for every channel they are in
+
+		// we will be lazy AF and call this function for each of the channels theyre in
+		params.app.mu.Lock()
+		channels := params.app.sessions[params.userId].joinedChannels
+		params.app.mu.Unlock()
+
+		for _, v := range channels {
+			updateChannelMemberList(updateChannelMemberListParameters{
+				params.app,
+				params.userId,
+				params.change,
+				v,
+			})
+		}
+
+	}else{
+		params.app.mu.Lock()
+		isPublic := params.app.channels[params.channelId].Public
+
+		// We only need to update that one channel
+
+		if(params.change==UserChannelJoin || params.change == UserChannelOnline){
+
+			params.app.channelMemberListCache[params.channelId].onlineMembers[params.userId]=params.app.sessions[params.userId]
+
+			if(params.change == UserChannelOnline){
+				delete(params.app.channelMemberListCache[params.channelId].offlineMembers, params.userId)
+				params.app.channelMemberListCache[params.channelId].offlineMemberCount--
+			}
+		}else{
+			delete(params.app.channelMemberListCache[params.channelId].onlineMembers, params.userId)
+
+			if(params.change == UserChannelOffline){
+				params.app.channelMemberListCache[params.channelId].offlineMemberCount++
+				if(!isPublic){
+					params.app.channelMemberListCache[params.channelId].offlineMembers[params.userId]=params.userId
+				}
+			}
+		}
+
+		online := params.app.channelMemberListCache[params.channelId].onlineMembers
+		state := params.app.channelMemberListCache[params.channelId]
+		params.app.mu.Unlock()
+
+		for _, v := range online {
+			if(v.currentChannelId==params.channelId){
+				go v.prog.Send(channelMemberListMsg(state))
+			}
+		}
 	}
 }
 
@@ -1020,6 +1173,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			tiCmd tea.Cmd
 			mvpCmd tea.Cmd
 			uvpCmd tea.Cmd
+			alertCmd tea.Cmd
 		)
 	switch m.viewMode {
 
@@ -1045,7 +1199,18 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 							if(len(command)>0){
 								switch strings.ToLower(command[0]){
 									case "ping":
+										myCustomAlert := bubbleup.AlertDefinition{
+											Key: "notif",
+											Prefix: "",
+											Style: lipgloss.NewStyle().
+											Background(lipgloss.Color("235")).
+											Foreground(lipgloss.Color("15")).
+											BorderStyle(lipgloss.NormalBorder()).
+											BorderForeground(lipgloss.Color("121")),
+										}
+										m.viewChatModel.alert.RegisterNewAlertType(myCustomAlert)
 										sendIslebotMessage(&m, "pong")
+										// alertCmd = m.viewChatModel.alert.NewAlertCmd("notif", "You have been invited to #0123456789, accept with /c join")
 									case "c","chan","channel":
 
 										chanHelpMsg :=  "Channel commands: /chan (create,join,leave)"
@@ -1073,14 +1238,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 															if(match){
 																// Name was OK
-
-																err := gorm.G[Channel](m.db).Create(context.Background(), &Channel{
+																newChannel := Channel{
 																	ID: newChannelName,
 																	OwnerID: m.viewChatModel.id,
 																	Banner: "Default channel banner :(",
 																	Public: true,
 																	ReadOnly: false,
-																})
+																}
+																err := gorm.G[Channel](m.db).Create(context.Background(), &newChannel)
 
 																if(err!=nil){
 																	sendIslebotMessage(&m, "Sorry but there was an error whilst creating the channel")
@@ -1088,9 +1253,16 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 																	// New channel was made
 																	m.app.mu.Lock()
-																	m.app.channelMembers[newChannelName]=make(map[string]*userSession)
-																	m.app.channelMembers[newChannelName][m.viewChatModel.id]=m.app.sessions[m.viewChatModel.id]
+																	// m.app.channelMembers[newChannelName]=make(map[string]*userSession)
+																	// m.app.channelMembers[newChannelName][m.viewChatModel.id]=m.app.sessions[m.viewChatModel.id]
 																	m.app.messages[newChannelName]=make([]chatMsg, 0)
+																	m.app.channelMemberListCache[newChannelName]=&channelMemberList{
+																		onlineMembers: make(map[string]*userSession),
+																		publicChannel: true,
+																		offlineMembers: make(map[string]string),
+																		offlineMemberCount: 0,
+																	}
+																	m.app.channels[newChannelName] = &newChannel
 																	m.app.mu.Unlock()
 
 																	// chan id might change so save it first then find it and change it
@@ -1109,6 +1281,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 																		unread: 0,
 																	})
 
+																	updateChannelMemberList(updateChannelMemberListParameters{
+																		app: m.app,
+																		userId: m.viewChatModel.id,
+																		change: UserChannelJoin,
+																		channelId: newChannelName,	
+																	})
+
 																	updateChannelList(&m)
 																}
 															}else{
@@ -1117,6 +1296,155 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 														}
 													}else{
 														sendIslebotMessage(&m, "Usage: /chan create [name]")
+													}
+												case "join":
+													// For now we are forgetting about invites and they will only join
+													// the channel if it is public and they are not already in it
+
+													if(len(command)==3){
+														m.app.mu.RLock()
+														channel, ok := m.app.channels[command[2]]
+														m.app.mu.RUnlock()
+														if(ok){
+															channelName := command[2]
+															userId := m.viewChatModel.id
+															if(channel.Public){
+																m.app.mu.RLock()
+																_, ok := m.app.channelMemberListCache[channelName].onlineMembers[userId]
+																m.app.mu.RUnlock()
+																if(!ok){
+																	// join
+																	// sendIslebotMessage(&m, fmt.Sprintf("%s wants to join #%s", userId, channelName))
+																	addUserToChannel(m.app, userId, channelName)
+																	updateChannelMemberList(updateChannelMemberListParameters{
+																		app: m.app,
+																		userId: userId,
+																		change: UserChannelJoin,
+																		channelId: channelName,
+																	})
+																	m.viewChatModel.channels = append(m.viewChatModel.channels, userChannelState{
+																		channelId: channelName,
+																		unread: 0,
+																	})
+																	updateChannelList(&m)
+																}else{
+																	sendIslebotMessage(&m, fmt.Sprintf("You are already a member of #%s. You can leave it with /chan leave %s", channelName, channelName))
+																}
+															}else{
+																// Maybe in the future send a nice welcome message in the channel or something
+																_, err := gorm.G[Invite](m.db).
+																		Where("user_id = ?", m.viewChatModel.id).
+																		Where("channel_id = ?", channelName).
+																		First(context.Background())
+																if(err==nil){
+																	_, err := gorm.G[Invite](m.db).
+																		Where("user_id = ?", m.viewChatModel.id).
+																		Where("channel_id = ?", channelName).
+																		Delete(context.Background())
+
+																	if(err==nil){
+																		addUserToChannel(m.app, userId, channelName)
+																		updateChannelMemberList(updateChannelMemberListParameters{
+																			app: m.app,
+																			userId: userId,
+																			change: UserChannelJoin,
+																			channelId: channelName,
+																		})
+																		m.viewChatModel.channels = append(m.viewChatModel.channels, userChannelState{
+																			channelId: channelName,
+																			unread: 0,
+																		})
+																		updateChannelList(&m)
+																	}else{
+																		sendIslebotMessage(&m, fmt.Sprintf("Sorry an error occured joining #%s", channelName))
+																	}
+																}else{
+																	sendIslebotMessage(&m, fmt.Sprintf("The channel #%s is private and you can only join if you are invited. The owner can invite you with /chan invite %s", channelName, userId))
+																}
+															}
+
+														}else{
+															sendIslebotMessage(&m, "Couldn't find a channel with that name. You can create it with /chan create <name>")
+														}
+													}else{
+														sendIslebotMessage(&m, "Usage: /chan create [name]")
+													}
+												case "invite":
+													if(len(command) == 3){
+														targetUser := command[2]
+														m.app.mu.RLock()
+														channel := m.app.channels[m.viewChatModel.channels[m.viewChatModel.currentChannel].channelId]
+														m.app.mu.RUnlock()
+														if(channel.OwnerID==m.viewChatModel.id){
+															if(!channel.Public){
+
+																// Check user is not in channel and user exists
+																m.app.mu.RLock()
+																_, onlineok := m.app.channelMemberListCache[channel.ID].onlineMembers[targetUser]
+																_, offlineok := m.app.channelMemberListCache[channel.ID].offlineMembers[targetUser]
+																m.app.mu.RUnlock()
+																if(!onlineok && !offlineok){
+																	// Check user exists
+																	_, err := gorm.G[User](m.db).
+																		Where("ID = ?", targetUser).
+																		First(context.Background())
+
+																	if(err==nil){
+																		err := gorm.G[Invite](m.db).Create(context.Background(), &Invite{
+																			UserID: targetUser,
+																			ChannelID: channel.ID,
+																		})
+																		if(err==nil){
+																			sendIslebotMessage(&m, fmt.Sprintf("The invite was sent to @%s, they can now join with /chan join %s", targetUser, channel.ID))
+																		}else{
+																			sendIslebotMessage(&m, fmt.Sprintf("The user @%s could not be invited to #%s. Either they are already invited or they do not exist", targetUser, channel.ID))
+																		}
+																	}else{
+																		sendIslebotMessage(&m, fmt.Sprintf("No user could be found: @%s", targetUser))
+																	}
+																}else{
+																	sendIslebotMessage(&m, fmt.Sprintf("The user @%s is already a member of #%s", targetUser, channel.ID))
+																}
+															}else{
+																sendIslebotMessage(&m, fmt.Sprintf("This channel is public. Anyone can join with /chan join %s", channel.ID))
+															}
+														}else{
+															sendIslebotMessage(&m, "You are not the owner of this channel")
+														}
+													}else{
+														sendIslebotMessage(&m, "Usage: /chan invite [user]")
+													}
+												case "uninvite":
+													if(len(command) == 3){
+														targetUser := command[2]
+														m.app.mu.RLock()
+														channel := m.app.channels[m.viewChatModel.channels[m.viewChatModel.currentChannel].channelId]
+														m.app.mu.RUnlock()
+														if(channel.OwnerID==m.viewChatModel.id){
+
+															_, err := gorm.G[Invite](m.db).
+																Where("user_id = ?", targetUser).
+																Where("channel_id = ?", channel.ID).
+																First(context.Background())
+
+															if(err == nil){
+																_, err := gorm.G[Invite](m.db).
+																	Where("user_id = ?", targetUser).
+																	Where("channel_id = ?", channel.ID).
+																	Delete(context.Background())
+																if(err == nil){
+																	sendIslebotMessage(&m, fmt.Sprintf("The user @%s was uninvited from #%s", targetUser, channel.ID))
+																}else{
+																	sendIslebotMessage(&m, "Sorry but an error occured whilst revoking the invite")
+																}
+															}else{
+																sendIslebotMessage(&m, "That user does not have an invite to this channel")
+															}
+														}else{
+															sendIslebotMessage(&m, "You are not the owner of this channel")
+														}
+													}else{
+														sendIslebotMessage(&m, "Usage: /chan invite [user]")
 													}
 												default:
 													sendIslebotMessage(&m, chanHelpMsg)
@@ -1163,8 +1491,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 							m.viewChatModel.currentChannel--
 							m.app.mu.Lock()
 							m.app.sessions[m.viewChatModel.id].currentChannelId=m.viewChatModel.channels[m.viewChatModel.currentChannel].channelId
+							m.viewChatModel.memberList=m.app.channelMemberListCache[m.viewChatModel.channels[m.viewChatModel.currentChannel].channelId]
 							m.app.mu.Unlock()
 							updateChannelList(&m)
+							updateUserList(&m)
 							reloadMessagesChannelSwitch(&m)
 						}
 					}
@@ -1180,8 +1510,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 							m.viewChatModel.currentChannel++
 							m.app.mu.Lock()
 							m.app.sessions[m.viewChatModel.id].currentChannelId=m.viewChatModel.channels[m.viewChatModel.currentChannel].channelId
+							m.viewChatModel.memberList=m.app.channelMemberListCache[m.viewChatModel.channels[m.viewChatModel.currentChannel].channelId]
 							m.app.mu.Unlock()
 							updateChannelList(&m)
+							updateUserList(&m)
 							reloadMessagesChannelSwitch(&m)
 
 						}
@@ -1256,9 +1588,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.viewChatModel.channels = msg
 				updateChannelList(&m)
 			
-			case memberList:
+			case channelMemberListMsg:
+				m.viewChatModel.memberList=msg
 				log.Info("Received member list!")
-				m.viewChatModel.memberList = msg
 				updateUserList(&m)
 			
 			case tea.QuitMsg:
@@ -1397,8 +1729,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 	}
 
+	outAlert, outCmd := m.viewChatModel.alert.Update(msg)
+	m.viewChatModel.alert = outAlert.(bubbleup.AlertModel)
 
-    return m, tea.Batch(tiCmd, mvpCmd, uvpCmd)
+    return m, tea.Batch(tiCmd, mvpCmd, uvpCmd, outCmd, alertCmd)
 }
 
 // yes, this is indeed ai slop
@@ -1490,7 +1824,7 @@ func getFullUserListBar(m model) string {
 
 	bannerStyle := lipgloss.NewStyle().Background(lipgloss.Color("235")).Foreground(lipgloss.Color("15"))
 
-	return bannerStyle.Render(banner)+ "\n"+ fmt.Sprintf("%s users online\n", humanize.Comma(int64(len(m.viewChatModel.memberList)))) + 
+	return bannerStyle.Render(banner)+ "\n"+ fmt.Sprintf("%s users online\n", humanize.Comma(int64(len(m.viewChatModel.memberList.onlineMembers)))) + 
 	 m.viewChatModel.userListViewport.View()
 }
 
@@ -1616,7 +1950,8 @@ func (m model) View() string {
 					}
 				}();
 			
-			return lipgloss.JoinHorizontal(lipgloss.Bottom, channelList, chatSection, userList)
+			return m.viewChatModel.alert.Render(
+				lipgloss.JoinHorizontal(lipgloss.Bottom, channelList, chatSection, userList))
 		case viewRegistration:
 
 			usernameBox := m.viewRegistrationModel.usernameInput.View()
@@ -1635,7 +1970,7 @@ func (m model) View() string {
 
 			titleRegBox := RegistrationBox()
 
-			return lipgloss.JoinVertical(lipgloss.Right, 
+			return m.viewChatModel.alert.Render(lipgloss.JoinVertical(lipgloss.Right, 
 				titleRegBox.Render("username", usernameBox, 26, m.viewRegistrationModel.FocusedBox==RegistrationUsernameFocused),
 				titleRegBox.Render("password", passwordBox, 26, m.viewRegistrationModel.FocusedBox==RegistrationPasswordFocused),
 				titleRegBox.Render("confirm", passwordConfirmBox, 26, m.viewRegistrationModel.FocusedBox==RegistrationPasswordConfirmFocused),
@@ -1647,7 +1982,7 @@ func (m model) View() string {
 					}
 				}(),
 				lipgloss.NewStyle().Foreground(lipgloss.Color("9")).Render(m.viewRegistrationModel.feedbackViewport.View()),
-			)
+			)) 
 
 		default:
 			return "Error!"

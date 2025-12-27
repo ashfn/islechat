@@ -11,6 +11,7 @@ import (
 	// "slices"
 	"strings"
 
+	"unicode"
 	// "strings"
 	"syscall"
 	"time"
@@ -84,6 +85,7 @@ type userSession struct {
 	// Will be nil if not logged in
 	username string
 	currentChannelId string
+	joinedChannels []string
 
 }
 
@@ -208,6 +210,7 @@ func newApp(db *gorm.DB) *app {
 	a.messages = make(map[string][]chatMsg)
 	a.channels = make(map[string]*Channel)
 	a.channelMembers = make(map[string]map[string]*userSession)
+	a.sessionUsernames = make(map[string]string)
 
 
 	channels, err := gorm.G[Channel](db).Find(context.Background())
@@ -263,8 +266,9 @@ func newApp(db *gorm.DB) *app {
 				if(VerifyPassword(password, user.Password)){
 					// Password was correct, we are good to go
 					
-
-
+					a.mu.Lock()
+					a.sessionUsernames[ctx.SessionID()]=ctx.User()
+					a.mu.Unlock()
 					ctx.SetValue("auth_status", "ok")
 					return true
 				}else{
@@ -327,8 +331,32 @@ func (a *app) Start() {
 func (a *app) CleanupMiddleware(next ssh.Handler) ssh.Handler {
     return func(s ssh.Session) {
 		defer func() {
+
+			username, ok := a.sessionUsernames[s.Context().SessionID()]
+			if(!ok){
+				log.Error(fmt.Sprintf("Logged out user left: %s", s.Context().SessionID()))
+				// User wasn't logged in
+				// Just clean them up from the sessions list
+				a.mu.Lock()
+				delete(a.sessions, s.Context().SessionID())
+				delete(a.sessionUsernames, s.Context().SessionID())
+				a.mu.Unlock()
+			}else{
+				log.Error(fmt.Sprintf("Logged in user left: %s", username))
+				a.mu.Lock()
+				for _,v := range a.sessions[username].joinedChannels{
+					delete(a.channelMembers[v], username)
+				}
+				a.mu.Unlock()
+				for _,v := range a.sessions[username].joinedChannels{
+					updateChannelMemberList(a, v)
+				}
+				a.mu.Lock()
+				delete(a.sessions, username)
+				a.mu.Unlock()
+			}
+
 			// The s.User() cannot be used here at all because someone can obviously be signing up 
-			log.Error(fmt.Sprintf("User left: %s", s.User()))
         }()
 	}
 }
@@ -362,9 +390,10 @@ func (a *app) ProgramHandler(s ssh.Session) *tea.Program {
 			loggedIn: true,
 			username: s.User(),
 			currentChannelId: "global",
+			joinedChannels: []string{},
 		}
 		a.mu.Unlock()
-		go joinedHandleChannels(&model)
+		go p.Send(channelList(joinedHandleChannels(&model)))
 	}else{
 		// We give it a temporary 'username' using the session id
 		log.Info(fmt.Sprintf("Sessid: %s", s.Context().SessionID()))
@@ -465,6 +494,7 @@ type viewChatModel struct {
 	messages    []chatMsg
 	channels []userChannelState
 	currentChannel int
+	channelBanner string
 	id          string
 	textarea    textarea.Model
 	senderStyle lipgloss.Style
@@ -498,7 +528,7 @@ func getNewChannelListViewport(a *app, width int, height int, focus FocusedBox) 
 }
 
 func getNewUserListViewport(a *app, width int, height int, focus FocusedBox) viewport.Model {
-	uvp := viewport.New(20, max(0,height-12))
+	uvp := viewport.New(20, max(0,height-13))
 	if(focus==FocusedBoxUserList){
 		VPEnableScrolling(&uvp)
 	}else{
@@ -524,33 +554,41 @@ func centerString(str string, width int) string {
 
 
 // For only when a user joins the main area (From logging in or just signing up)
-func joinedHandleChannels(m *model) {
+func joinedHandleChannels(m *model) []userChannelState  {
 	// Update the users channel list from the DB
 	// Update the user list for everyone in their channels
 
-	m.viewChatModel.channels = make([]userChannelState, 0)
+	channels := make([]userChannelState, 0)
 
 	var channelIDs []string
+
+	channels = append(channels, userChannelState{
+		channelId: "global",
+		unread: 0,
+	})
 
 	// We query the join table specifically to get the IDs for this User
 	err := m.app.db.Table("user_channels").
 		Where("user_id = ?", m.viewChatModel.id).
+		Order("channel_id DESC").
 		Pluck("channel_id", &channelIDs).Error
+
 
 	if(err!=nil){
 		// That would be really weird if we ended up here
 		log.Error("Error was NOT NIL!")
 		log.Error(err)
-		return
+		return []userChannelState{}
 	}
 
 	// Adding the channels for the user
 	for _, channel := range channelIDs {
-
-		m.viewChatModel.channels = append(m.viewChatModel.channels, userChannelState{
-			channelId: channel,
-			unread: 0,
-		})
+		if(channel!="global"){
+			channels = append(channels, userChannelState{
+				channelId: channel,
+				unread: 0,
+			})
+		}
 	}
 
 	// Adding the user to online member list for their channels
@@ -558,13 +596,15 @@ func joinedHandleChannels(m *model) {
 	for _, channel := range channelIDs {
 		log.Info(fmt.Sprintf("Chan: %s, id: %s", channel, m.viewChatModel.id))
 		m.app.channelMembers[channel][m.viewChatModel.id]=m.app.sessions[m.viewChatModel.id]
+		m.app.sessions[m.viewChatModel.id].joinedChannels = append(m.app.sessions[m.viewChatModel.id].joinedChannels, channel)
 	}
+	
 	m.app.mu.Unlock()
 
 	for _, channel := range channelIDs {
-		updateChannelMemberList(m, channel)
+		updateChannelMemberList(m.app, channel)
 	}
-
+	return channels
 }
 
 
@@ -614,12 +654,12 @@ func initialModel(a *app, width int, height int, sess ssh.Session) model {
 
 	channelList := make([]userChannelState, 0)
 
-	for c, _ := range a.messages {
-		channelList = append(channelList, userChannelState{
-			channelId: c,
-			unread: 0,
-		})
-	}
+	// for c, _ := range a.messages {
+	// 	channelList = append(channelList, userChannelState{
+	// 		channelId: c,
+	// 		unread: 0,
+	// 	})
+	// }
 
 	// Registration parts
 
@@ -652,6 +692,8 @@ func initialModel(a *app, width int, height int, sess ssh.Session) model {
 
 	if(sess.Context().Value("auth_status")=="ok"){
 
+
+		
 		// Add session to db
 		return model{
 
@@ -668,6 +710,15 @@ func initialModel(a *app, width int, height int, sess ssh.Session) model {
 				dateStyle: lipgloss.NewStyle().Foreground(lipgloss.Color("238")),
 				currentChannel: 0,
 				channels: channelList,
+				channelBanner: `⠀⣠⣴⣦⣽⣿⣾⣿⣷⣟⣋⡁⠀⠀ 
+								⠀⢀⣬⣽⣿⣿⣿⣿⣿⣿⣿⠿⠗⠀ 
+								⠠⠛⠋⢩⣿⡟⣿⣏⠙⠻⢿⣷⠀⠀ 
+								⠀⠀⠀⡿⠋⠀⡟⢻⡀⠀⠀⠈⠃⠀ 
+								⠀⠀⠀⠀⠀⠘⠁⢸⡇⠀⠀⠀⠀⠀ 
+								⠀⠀⠀⠀⠀⠀⠀⢸⡇⠀isle.chat 
+								⠀⠀⠀⠀⠀⠀⠀⣾⡇⠀loading..
+								⠀⠀⠀⠀⠀⠀⣀⣿⡇⠀⠀⠀⠀⠀ 
+								⠀⢀⣄⣶⣿⣿⣟⣻⣻⣯⣕⣒⣄⡀  `,
 				err:         nil,
 				memberList: make([]*userSession, 0),
 				focus: FocusedBoxChatInput,	
@@ -703,6 +754,15 @@ func initialModel(a *app, width int, height int, sess ssh.Session) model {
 				currentChannel: 0,
 				channels: channelList,
 				err:         nil,
+				channelBanner: `⠀⣠⣴⣦⣽⣿⣾⣿⣷⣟⣋⡁⠀⠀ 
+								⠀⢀⣬⣽⣿⣿⣿⣿⣿⣿⣿⠿⠗⠀ 
+								⠠⠛⠋⢩⣿⡟⣿⣏⠙⠻⢿⣷⠀⠀ 
+								⠀⠀⠀⡿⠋⠀⡟⢻⡀⠀⠀⠈⠃⠀ 
+								⠀⠀⠀⠀⠀⠘⠁⢸⡇⠀⠀⠀⠀⠀ 
+								⠀⠀⠀⠀⠀⠀⠀⢸⡇⠀isle.chat 
+								⠀⠀⠀⠀⠀⠀⠀⣾⡇⠀loading..
+								⠀⠀⠀⠀⠀⠀⣀⣿⡇⠀⠀⠀⠀⠀ 
+								⠀⢀⣄⣶⣿⣿⣟⣻⣻⣯⣕⣒⣄⡀  `,
 				memberList: make([]*userSession, 0),
 				focus: FocusedBoxChatInput,
 			},
@@ -768,6 +828,14 @@ func updateChannelList(m *model){
 		}
 	}
 
+	if(m.viewChatModel.currentChannel<len(m.viewChatModel.channels)){
+		channel, ok := m.app.channels[m.viewChatModel.channels[m.viewChatModel.currentChannel].channelId]
+		if(ok){
+			m.viewChatModel.channelBanner = channel.Banner
+		}
+	}
+
+
 	m.viewChatModel.channelListViewport.SetContent(channelListText)
 }
 
@@ -812,6 +880,35 @@ func reloadMessagesChannelSwitch(m *model){
 	updateChatLines(m)
 }
 
+// Adds a user to a channel, adding them to the database and updating
+// all the state and user lists
+func addUserToChannel(app *app, user string, channel string) bool {
+	// err := gorm.G[User](app.db).Where("id = ?", user).Update(context.Background(), "name", "hello")
+
+	dbuser := User{ID: user}
+
+	// 2. Use the Association API to append the channel
+	// This automatically handles the 'user_channels' join table
+	err := app.db.Model(&dbuser).Association("Channels").Append(&Channel{ID: channel})
+
+	if(err!=nil){
+		// Error was encountered and user couldn't be added
+		return false
+	}
+
+	app.mu.Lock()
+	app.sessions[user].joinedChannels = append(app.sessions[user].joinedChannels, channel)
+	app.channelMembers[channel][user]=app.sessions[user]
+	app.mu.Unlock()
+	
+	updateChannelMemberList(app, channel)
+
+	// Update the user's channel list
+
+
+	return true	
+}
+
 func updateRegistrationTextFocuses(m *model){
 	switch m.viewRegistrationModel.FocusedBox {
 		case RegistrationUsernameFocused:
@@ -835,45 +932,87 @@ func updateRegistrationTextFocuses(m *model){
 
 type memberList []*userSession
 
-func updateChannelMemberList(m *model, channelId string){
-	m.app.mu.RLock()
-	members := make([]*userSession, 0, len(m.app.channelMembers[channelId]))
-	for _,v := range m.app.channelMembers[channelId]{
+type channelMemberList struct {
+	onlineMembers []*userSession
+	
+}
+
+func updateChannelMemberList(app *app, channelId string){
+	app.mu.RLock()
+	members := make([]*userSession, 0, len(app.channelMembers[channelId]))
+	for _,v := range app.channelMembers[channelId]{
 		if((*v).loggedIn){
 			members = append(members, v)
 		}
 	}
-	m.app.mu.RUnlock()
+	app.mu.RUnlock()
 	for _,v := range members{
 		go (*v).prog.Send(memberList(members))
 	}
 }
 
-func userLeft(m *model){
+// func userLeftx(m *model){
 
-	if(m.viewMode==viewChat){
-		// Also need to add update stuff but can do that later
-		log.Error("Left")
-		m.app.mu.Lock()
-		for _,v := range m.viewChatModel.channels{
-			delete(m.app.channelMembers[v.channelId], m.viewChatModel.id)
-		}
-		// m.viewChatModel.channels
-		delete(m.app.sessions, m.viewChatModel.id)
-		m.app.mu.Unlock()
-		for _,v := range m.viewChatModel.channels{
-			updateChannelMemberList(m, v.channelId)
-		}
+// 	if(m.viewMode==viewChat){
+// 		// Also need to add update stuff but can do that later
+// 		log.Error("Left")
+// 		m.app.mu.Lock()
+// 		for _,v := range m.viewChatModel.channels{
+// 			delete(m.app.channelMembers[v.channelId], m.viewChatModel.id)
+// 		}
+// 		// m.viewChatModel.channels
+// 		delete(m.app.sessions, m.viewChatModel.id)
+// 		m.app.mu.Unlock()
+// 		for _,v := range m.viewChatModel.channels{
+// 			updateChannelMemberList(m.app, v.channelId)
+// 		}
 
-	}else{
+// 	}else{
 
-		m.app.mu.Lock()
-		delete(m.app.sessions, m.viewChatModel.id)
-		m.app.mu.Unlock()
+// 		m.app.mu.Lock()
+// 		delete(m.app.sessions, m.viewChatModel.id)
+// 		m.app.mu.Unlock()
 
-		// We dont need to handle updating user lists or anything as they aren't registered
+// 		// We dont need to handle updating user lists or anything as they aren't registered
+// 	}
+
+// }
+
+func sendIslebotMessage(m *model, msg string){
+	m.viewChatModel.messages = append(m.viewChatModel.messages, chatMsg{
+		sender: "islebot",
+		text: msg,
+		time: time.Now(),
+		channel: m.viewChatModel.channels[m.viewChatModel.currentChannel].channelId,
+	})
+	updateChatLines(m)
+}
+
+func updatedChatFocus(m *model){
+	switch m.viewChatModel.focus {
+		case FocusedBoxChatHistory:
+			m.viewChatModel.textarea.Blur()
+			VPDisableScrolling(&m.viewChatModel.userListViewport)
+			VPDisableScrolling(&m.viewChatModel.channelListViewport)
+			VPEnableScrolling(&m.viewChatModel.messageHistoryViewport)
+		case FocusedBoxChatInput:
+			m.viewChatModel.textarea.Focus()
+			m.viewChatModel.messageHistoryViewport.GotoBottom()
+			VPDisableScrolling(&m.viewChatModel.messageHistoryViewport)
+			VPDisableScrolling(&m.viewChatModel.channelListViewport)
+			VPDisableScrolling(&m.viewChatModel.userListViewport)
+		case FocusedBoxUserList:
+			m.viewChatModel.textarea.Blur()
+			VPDisableScrolling(&m.viewChatModel.messageHistoryViewport)
+			VPDisableScrolling(&m.viewChatModel.channelListViewport)
+			VPEnableScrolling(&m.viewChatModel.userListViewport)
+		case FocusedBoxChannelList:
+			m.viewChatModel.textarea.Blur()
+			VPDisableScrolling(&m.viewChatModel.messageHistoryViewport)
+			VPDisableScrolling(&m.viewChatModel.userListViewport)
+			VPEnableScrolling(&m.viewChatModel.channelListViewport)
 	}
-
+	updateChannelList(m)
 }
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -885,7 +1024,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch m.viewMode {
 
 		case viewChat:
-			m.viewChatModel.textarea, tiCmd = m.viewChatModel.textarea.Update(msg)
 			switch msg := msg.(type) {
 
 			case tea.KeyMsg:
@@ -896,7 +1034,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				switch msg.Type {
 				case tea.KeyCtrlC, tea.KeyEsc:
 					// Need generic method for when a user left
-					userLeft(&m)
+					// userLeft(&m)
 					return m, tea.Quit
 				case tea.KeyEnter:
 					if m.viewChatModel.textarea.Value() != "" {
@@ -907,22 +1045,86 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 							if(len(command)>0){
 								switch strings.ToLower(command[0]){
 									case "ping":
-										m.viewChatModel.messages = append(m.viewChatModel.messages, chatMsg{
-											sender: "islebot",
-											text: "pong",
-											time: time.Now(),
-											channel: m.viewChatModel.channels[m.viewChatModel.currentChannel].channelId,
-										})
-										updateChatLines(&m)
+										sendIslebotMessage(&m, "pong")
 									case "c","chan","channel":
 
-										m.viewChatModel.messages = append(m.viewChatModel.messages, chatMsg{
-											sender: "islebot",
-											text: "You are currently in the #global channel",
-											time: time.Now(),
-											channel: m.viewChatModel.channels[m.viewChatModel.currentChannel].channelId,
-										})
-										updateChatLines(&m)
+										chanHelpMsg :=  "Channel commands: /chan (create,join,leave)"
+
+										if(len(command)>1){
+											switch command[1]{
+												case "create":
+													if(len(command)==3){
+														newChannelName := command[2]
+
+														// Check if the name exists
+														channel,ok := m.app.channels[newChannelName]
+
+														if(ok){
+															//
+															if(channel.Public){
+																sendIslebotMessage(&m, fmt.Sprintf("Sorry but the channel #%s already exists, it was created by @%s. The channel is public so you can join with /chan join %s", newChannelName, channel.OwnerID, newChannelName))
+															}else{
+																sendIslebotMessage(&m, fmt.Sprintf("Sorry but the channel #%s already exists, it was created by @%s. The channel is private so you can join once invited", newChannelName, channel.OwnerID))
+															}
+														}else{
+
+															// Validate the name
+															match, _ := regexp.MatchString("^[a-zA-Z0-9_-]{1,10}$", newChannelName)
+
+															if(match){
+																// Name was OK
+
+																err := gorm.G[Channel](m.db).Create(context.Background(), &Channel{
+																	ID: newChannelName,
+																	OwnerID: m.viewChatModel.id,
+																	Banner: "Default channel banner :(",
+																	Public: true,
+																	ReadOnly: false,
+																})
+
+																if(err!=nil){
+																	sendIslebotMessage(&m, "Sorry but there was an error whilst creating the channel")
+																}else{
+
+																	// New channel was made
+																	m.app.mu.Lock()
+																	m.app.channelMembers[newChannelName]=make(map[string]*userSession)
+																	m.app.channelMembers[newChannelName][m.viewChatModel.id]=m.app.sessions[m.viewChatModel.id]
+																	m.app.messages[newChannelName]=make([]chatMsg, 0)
+																	m.app.mu.Unlock()
+
+																	// chan id might change so save it first then find it and change it
+
+																	oldCurChan := m.viewChatModel.channels[m.viewChatModel.currentChannel].channelId
+																	addUserToChannel(m.app, m.viewChatModel.id, newChannelName)
+
+																	for i, c := range m.viewChatModel.channels {
+																		if(c.channelId==oldCurChan){
+																			m.viewChatModel.currentChannel = i
+																		}
+																	}
+
+																	m.viewChatModel.channels = append(m.viewChatModel.channels, userChannelState{
+																		channelId: newChannelName,
+																		unread: 0,
+																	})
+
+																	updateChannelList(&m)
+																}
+															}else{
+																sendIslebotMessage(&m, "Invalid name. Please use 1–10 letters, numbers, underscores, or hyphens.")
+															}
+														}
+													}else{
+														sendIslebotMessage(&m, "Usage: /chan create [name]")
+													}
+												default:
+													sendIslebotMessage(&m, chanHelpMsg)
+											}
+										}else{
+											sendIslebotMessage(&m, chanHelpMsg)
+										}
+
 
 									default:
 										m.viewChatModel.messages = append(m.viewChatModel.messages, chatMsg{
@@ -949,53 +1151,89 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				case tea.KeyTab:
 					m.viewChatModel.focus++
 					m.viewChatModel.focus %= FocusedTypesLength
+					updatedChatFocus(&m)
 
-					switch m.viewChatModel.focus {
-						case FocusedBoxChatHistory:
-							m.viewChatModel.textarea.Blur()
-							VPDisableScrolling(&m.viewChatModel.userListViewport)
-							VPDisableScrolling(&m.viewChatModel.channelListViewport)
-							VPEnableScrolling(&m.viewChatModel.messageHistoryViewport)
-						case FocusedBoxChatInput:
-							m.viewChatModel.textarea.Focus()
-							m.viewChatModel.messageHistoryViewport.GotoBottom()
-							VPDisableScrolling(&m.viewChatModel.messageHistoryViewport)
-							VPDisableScrolling(&m.viewChatModel.channelListViewport)
-							VPDisableScrolling(&m.viewChatModel.userListViewport)
-						case FocusedBoxUserList:
-							m.viewChatModel.textarea.Blur()
-							VPDisableScrolling(&m.viewChatModel.messageHistoryViewport)
-							VPDisableScrolling(&m.viewChatModel.channelListViewport)
-							VPEnableScrolling(&m.viewChatModel.userListViewport)
-						case FocusedBoxChannelList:
-							m.viewChatModel.textarea.Blur()
-							VPDisableScrolling(&m.viewChatModel.messageHistoryViewport)
-							VPDisableScrolling(&m.viewChatModel.userListViewport)
-							VPEnableScrolling(&m.viewChatModel.channelListViewport)
-					}
-					updateChannelList(&m)
 				}
+
+				// Handle additional controls from in the chat box (Left and up)
+
 				if msg.Type == tea.KeyUp || (msg.Type == tea.KeyRunes && msg.Runes[0] == 'k') {
 					if(m.viewChatModel.focus==FocusedBoxChannelList){
 						if(m.viewChatModel.currentChannel>0){
 							m.viewChatModel.currentChannel--
+							m.app.mu.Lock()
+							m.app.sessions[m.viewChatModel.id].currentChannelId=m.viewChatModel.channels[m.viewChatModel.currentChannel].channelId
+							m.app.mu.Unlock()
 							updateChannelList(&m)
 							reloadMessagesChannelSwitch(&m)
 						}
+					}
+					// Also allow going up from chat to chat history if your on the first line
+					if(m.viewChatModel.focus==FocusedBoxChatInput && msg.Type == tea.KeyUp && m.viewChatModel.textarea.Line()==0){
+						m.viewChatModel.focus = FocusedBoxChatHistory
+						updatedChatFocus(&m)
 					}
 				}
 				if msg.Type == tea.KeyDown || (msg.Type == tea.KeyRunes && msg.Runes[0] == 'j') {
 					if(m.viewChatModel.focus==FocusedBoxChannelList){
 						if(m.viewChatModel.currentChannel<len(m.viewChatModel.channels)-1){
 							m.viewChatModel.currentChannel++
+							m.app.mu.Lock()
+							m.app.sessions[m.viewChatModel.id].currentChannelId=m.viewChatModel.channels[m.viewChatModel.currentChannel].channelId
+							m.app.mu.Unlock()
 							updateChannelList(&m)
 							reloadMessagesChannelSwitch(&m)
 
 						}
 					}
+
+					// Also allow going down from view history to chat if your at the bottom
+					// Also allow using j key (We dont allow k in the chat box incase they want to type that it would be annoying)
+					if(m.viewChatModel.focus==FocusedBoxChatHistory && m.viewChatModel.messageHistoryViewport.AtBottom()){
+						m.viewChatModel.focus = FocusedBoxChatInput
+						updatedChatFocus(&m)
+					}
+				}
+
+				// Allow using right arrow key or l to go from channel list to chat box
+				if msg.Type == tea.KeyRight || (msg.Type == tea.KeyRunes && msg.Runes[0] == 'l') {
+					if(m.viewChatModel.focus==FocusedBoxChannelList){
+						m.viewChatModel.focus = FocusedBoxChatHistory
+						updatedChatFocus(&m)
+					}else if(m.viewChatModel.focus == FocusedBoxChatHistory){
+						m.viewChatModel.focus = FocusedBoxUserList
+						updatedChatFocus(&m)
+					}else if(msg.Type == tea.KeyRight && m.viewChatModel.focus == FocusedBoxChatInput){
+						info := m.viewChatModel.textarea.LineInfo()
+						log.Info(fmt.Sprintf("%d %d", info.CharOffset, info.CharWidth))
+						// Only change focus if the cursor is at the end of the line
+						if(info.CharOffset>=info.CharWidth-1){
+							m.viewChatModel.focus = FocusedBoxUserList
+							updatedChatFocus(&m)
+						}
+					}
+				}
+
+				// Allow using left arrow key or h to go from user list to chat box
+				if msg.Type == tea.KeyLeft || (msg.Type == tea.KeyRunes && msg.Runes[0] == 'h') {
+					if(m.viewChatModel.focus==FocusedBoxUserList){
+						m.viewChatModel.focus = FocusedBoxChatHistory
+						updatedChatFocus(&m)
+					}else if(m.viewChatModel.focus == FocusedBoxChatHistory){
+						m.viewChatModel.focus = FocusedBoxChannelList
+						updatedChatFocus(&m)
+					}else if(msg.Type == tea.KeyLeft && m.viewChatModel.focus == FocusedBoxChatInput){
+						info := m.viewChatModel.textarea.LineInfo()
+						// log.Info(fmt.Sprintf("%d %d", info.CharOffset, info.CharWidth))
+						// Only change focus if the cursor is at the end of the line
+						if(info.RowOffset==0 && info.CharOffset==0){
+							m.viewChatModel.focus = FocusedBoxChannelList
+							updatedChatFocus(&m)
+						}
+					}
 				}
 			
-			
+
 
 			case tea.WindowSizeMsg:
 				// m.windowHeight = msg.Height
@@ -1014,6 +1252,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					updateChatLines(&m)
 				}
 			case channelList:
+				log.Info("Received channel list: ",msg)
 				m.viewChatModel.channels = msg
 				updateChannelList(&m)
 			
@@ -1023,7 +1262,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				updateUserList(&m)
 			
 			case tea.QuitMsg:
-				userLeft(&m)
+				// userLeft(&m)
 				// User left
 				// delete(m.app.progs, m.viewChatModel.id)
 				// m.app.updateUserlists()
@@ -1032,6 +1271,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.viewChatModel.err = msg
 				return m, nil
 			}
+			// Put it down here so we can do the other stuff first
+			m.viewChatModel.textarea, tiCmd = m.viewChatModel.textarea.Update(msg)
+
+
+
 		case viewRegistration:
 			m.viewRegistrationModel.usernameInput, tiCmd = m.viewRegistrationModel.usernameInput.Update(msg)
 			m.viewRegistrationModel.passwordInput, tiCmd = m.viewRegistrationModel.passwordInput.Update(msg)
@@ -1044,7 +1288,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					// User left
 					// delete(m.app.progs, m.viewChatModel.id)
 					// m.app.updateUserlists()
-					userLeft(&m)
+					// userLeft(&m)
 					return m, tea.Quit
 				}
 				if(msg.Type == tea.KeyEnter || msg.Type == tea.KeyTab || msg.Type == tea.KeyDown){
@@ -1099,10 +1343,16 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 									loggedIn: true,
 									username: newUsername,
 									currentChannelId: "global",
+									joinedChannels: []string{},
 								}
+								// Set username in sessionUsernames so session closing can be handled
+								m.app.sessionUsernames[m.viewChatModel.id]=newUsername
 								m.app.mu.Unlock()
 								m.viewChatModel.id = newUsername
-
+								// Add user to global channel
+								addUserToChannel(m.app, newUsername, "global")
+								go prog.Send(channelList(joinedHandleChannels(&m)))
+								// updateChannelMemberList(m.app, "global")
 								// Account was created
 								m.viewMode=viewChat
 
@@ -1129,7 +1379,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			case tea.QuitMsg:
 				// delete(m.app.progs, m.viewChatModel.id)
 				// m.app.updateUserlists()
-				userLeft(&m)
+				// userLeft(&m)
 			case tea.WindowSizeMsg:
 				// m.windowHeight = msg.Height
 				// m.windowWidth = msg.Width
@@ -1151,18 +1401,93 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
     return m, tea.Batch(tiCmd, mvpCmd, uvpCmd)
 }
 
+// yes, this is indeed ai slop
+// gemini 3 if your interested
+func FormatBanner(input string) string {
+	const width = 20
+	const height = 10
+
+	// 1. Normalize line endings. 
+	// We do NOT trim leading/trailing whitespace because TUI art relies on it.
+	input = strings.ReplaceAll(input, "\r\n", "\n")
+	originalLines := strings.Split(input, "\n")
+
+	var finalRows []string
+
+	// 2. Process each line for wrapping
+	for _, line := range originalLines {
+		runes := []rune(line)
+
+		// Handle explicit empty lines
+		if len(runes) == 0 {
+			finalRows = append(finalRows, "")
+			continue
+		}
+
+		// 3. Wrap Logic: Keep chunking until the line is exhausted
+		for len(runes) > 0 {
+			// Stop if we've filled the 10-row vertical limit
+			if len(finalRows) >= height {
+				break
+			}
+
+			chunkSize := width
+			if len(runes) < width {
+				chunkSize = len(runes)
+			}
+
+			// Clean control characters (tabs, etc) to prevent terminal misalignment
+			chunk := make([]rune, chunkSize)
+			for i := 0; i < chunkSize; i++ {
+				if unicode.IsControl(runes[i]) {
+					chunk[i] = ' '
+				} else {
+					chunk[i] = runes[i]
+				}
+			}
+
+			finalRows = append(finalRows, string(chunk))
+			runes = runes[chunkSize:]
+		}
+	}
+
+	// 4. Final Grid Construction
+	var sb strings.Builder
+	for i := 0; i < height; i++ {
+		var content string
+		var contentWidth int
+
+		if i < len(finalRows) {
+			content = finalRows[i]
+			contentWidth = len([]rune(content))
+		}
+
+		// Write the content we have for this row
+		sb.WriteString(content)
+
+		// 5. Fill to exactly 20 spaces
+		// This ensures the "new space" is always filled to the edge
+		padding := width - contentWidth
+		if padding > 0 {
+			sb.WriteString(strings.Repeat(" ", padding))
+		}
+
+		// Add newline for all but the last row to maintain TUI block shape
+		if i < height-1 {
+			sb.WriteRune('\n')
+		}
+	}
+
+	return sb.String()
+}
 
 
 func getFullUserListBar(m model) string {
-	banner := `⠀⣠⣴⣦⣽⣿⣾⣿⣷⣟⣋⡁⠀⠀ 
-⠀⢀⣬⣽⣿⣿⣿⣿⣿⣿⣿⠿⠗⠀ 
-⠠⠛⠋⢩⣿⡟⣿⣏⠙⠻⢿⣷⠀⠀ 
-⠀⠀⠀⡿⠋⠀⡟⢻⡀⠀⠀⠈⠃⠀ 
-⠀⠀⠀⠀⠀⠘⠁⢸⡇⠀⠀⠀⠀⠀ 
-⠀⠀⠀⠀⠀⠀⠀⢸⡇⠀isle.chat 
-⠀⠀⠀⠀⠀⠀⠀⣾⡇⠀⠀#global 
-⠀⠀⠀⠀⠀⠀⣀⣿⡇⠀⠀⠀⠀⠀ 
-⠀⢀⣄⣶⣿⣿⣟⣻⣻⣯⣕⣒⣄⡀  `
+
+	banner := FormatBanner(m.viewChatModel.channelBanner)
+
+
+
 	bannerStyle := lipgloss.NewStyle().Background(lipgloss.Color("235")).Foreground(lipgloss.Color("15"))
 
 	return bannerStyle.Render(banner)+ "\n"+ fmt.Sprintf("%s users online\n", humanize.Comma(int64(len(m.viewChatModel.memberList)))) + 

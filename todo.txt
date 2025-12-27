@@ -10,6 +10,16 @@ public channels auto joined
 global
 
 
+=== THIS CAR JOURNEY ===
+[x] Proper channel sorting when joining with global at top then alphabetically (For now theyre not re-sorted hwen you join/create/leave a channel 80/20 rule mvp)
+[x] Change banners when you change channel
+[] Member list with online and offline count for public chans and offline user list for private channels
+[] Channel leave command
+ - Only announces your leave if the channel is private
+[] Channel join command
+ - Only announces your join if the channel is private
+
+
 new|make|create <name> -> name is optional but makes a new channel with you as the owner
 public -> makes the current channel public if you are the owner of it (anyone can join)
 private -> makes the current channel private if you are the owner of it (invite only)
@@ -35,3 +45,11 @@ Only show offline users in private channels
 [x] sign up/sign in (Just username/pass for now)
 [] nicer flow/ux like using arrows and hjjkl as well as tab to focus different boxes
 [] mentions with @ and notifications (special for mention otherwise just white instead of gray)
+[] keybinds show at the bottom and are context based
+[] keybind to collapse the nav bars and fullscreen the chat
+
+
+Web page paths
+/ main portal
+/banner banner creator/editor
+/badge?chan=channel shows a badge for a channel with the name, online members and offline members

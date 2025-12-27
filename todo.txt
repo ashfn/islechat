@@ -1,3 +1,6 @@
+isle.chat
+
+persistent ssh chat server like discord with accounts, channels etc
 
 [] commands
 [] channels with membership/ownership (Currently all global)
@@ -9,7 +12,7 @@ public channels auto joined
 
 global
 
-
+/channel banner       ⢤⣤⣀   lol         ⢀⠔⠉ ⠈⠑⠂⠄    ⢀⠔⠂ lol ⡏  ⡆  ⡄ ⠈ ⠢⣀        ⡇  ⡇  ⡇    ⠈⠳⡀      ⡇⢀⡀⠁         ⢣      ⢱ ⠙⠢⣀⡀  ⢀⡰⠂  ⢸       ⠡⡀  ⠈⠉⠉⠉    ⠇    ⢀⣀⡀ ⠈⠒⠢⠤⠤⣀⣀⡀⢀⡠⠊          ⠠⢄⣀⡀     ⠸⡄    lol        lol    
 === THIS CAR JOURNEY ===
 [x] Proper channel sorting when joining with global at top then alphabetically (For now theyre not re-sorted hwen you join/create/leave a channel 80/20 rule mvp)
 [x] Change banners when you change channel
@@ -21,16 +24,17 @@ global
 
 
 [x] new|make|create <name> -> name is optional but makes a new channel with you as the owner
-[] public -> makes the current channel public if you are the owner of it (anyone can join)
-[] private -> makes the current channel private if you are the owner of it (invite only)
+[x] public -> makes the current channel public if you are the owner of it (anyone can join)
+[x] private -> makes the current channel private if you are the owner of it (invite only)
 [x] invite <user> -> invites the user to the channel if it is private (shows error if public or not owner)
 [x] uninvite <user> -> revokes a users invite to the channel (shows error if public or not owner)
 [x] join <channel> -> joins the channel if it is public or you are invited
+[] leave -> leaves the current channel if you are not the owner and its not global
 [] kick <user> -> kicks the user from the channel if your the owner
 [] ban <user> -> bans he user from the channel (only works if the channel is public)
+[] unban <user> -> duh
 [] delete -> deletes the channel if your the owner
-[] banner <text> changes the banner of the channel
-[] readonly toggles whether the channel is read only
+[x] banner <text> changes the banner of the channel
 
 change user's channels
  -> update DB channels
@@ -46,9 +50,9 @@ Only show offline users in private channels
 [] dates show with full date when its >= 24h ago
 [x] sign up/sign in (Just username/pass for now)
 [x] nicer flow/ux like using arrows and hjjkl as well as tab to focus different boxes
-[] mentions with @ and notifications (special for mention otherwise just white instead of gray)
+
 [] keybinds show at the bottom and are context based
-[] keybind to collapse the nav bars and fullscreen the chat
+
 
 
 Web page paths

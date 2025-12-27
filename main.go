@@ -846,6 +846,7 @@ func simpleMarkdown(text string) string {
     return text
 }
 
+
 func updateUserList(m *model){
 	var content strings.Builder
     
@@ -1141,6 +1142,19 @@ func sendIslebotMessage(m *model, msg string){
 	updateChatLines(m)
 }
 
+func BannerWidth(s string) int {
+    width := 0
+    for _, r := range s {
+        if r >= 0x2800 && r <= 0x28FF {
+            width++ // Braille patterns (1 column each)
+        } else if r < 128 {
+            width++ // ASCII
+        }
+        // Everything else is ignored/stripped
+    }
+    return width
+}
+
 func updatedChatFocus(m *model){
 	switch m.viewChatModel.focus {
 		case FocusedBoxChatHistory:
@@ -1167,6 +1181,8 @@ func updatedChatFocus(m *model){
 	}
 	updateChannelList(m)
 }
+
+type newBannerMsg string
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var (
@@ -1200,18 +1216,19 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 								switch strings.ToLower(command[0]){
 									case "ping":
 										myCustomAlert := bubbleup.AlertDefinition{
-											Key: "notif",
+											Key: "invitenotif",
 											Prefix: "",
+											ForeColor: "#17b27eff",
 											Style: lipgloss.NewStyle().
+											BorderStyle(lipgloss.NormalBorder()).
 											Background(lipgloss.Color("235")).
 											Foreground(lipgloss.Color("15")).
-											BorderStyle(lipgloss.NormalBorder()).
 											BorderForeground(lipgloss.Color("121")),
 										}
 										m.viewChatModel.alert.RegisterNewAlertType(myCustomAlert)
 										sendIslebotMessage(&m, "pong")
-										// alertCmd = m.viewChatModel.alert.NewAlertCmd("notif", "You have been invited to #0123456789, accept with /c join")
-									case "c","chan","channel":
+										alertCmd = m.viewChatModel.alert.NewAlertCmd("invitenotif", "You have been invited to #0123456789")
+									case "chan":
 
 										chanHelpMsg :=  "Channel commands: /chan (create,join,leave)"
 
@@ -1367,7 +1384,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 															sendIslebotMessage(&m, "Couldn't find a channel with that name. You can create it with /chan create <name>")
 														}
 													}else{
-														sendIslebotMessage(&m, "Usage: /chan create [name]")
+														sendIslebotMessage(&m, "Usage: /chan join [name]")
 													}
 												case "invite":
 													if(len(command) == 3){
@@ -1444,7 +1461,148 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 															sendIslebotMessage(&m, "You are not the owner of this channel")
 														}
 													}else{
-														sendIslebotMessage(&m, "Usage: /chan invite [user]")
+														sendIslebotMessage(&m, "Usage: /chan uninvite [user]")
+													}
+												case "public":
+													if(len(command) == 2){
+														m.app.mu.RLock()
+														channel := m.app.channels[m.viewChatModel.channels[m.viewChatModel.currentChannel].channelId]
+														m.app.mu.RUnlock()
+														if(channel.OwnerID==m.viewChatModel.id){
+															if(!channel.Public){
+																// Update all the meta info and the DB
+																// Delete all invites maybe?
+																_, err := gorm.G[Channel](m.app.db).Where("id = ?", channel.ID).
+																	Update(context.Background(), "public", true)
+																
+																if(err==nil){
+																	_, err := gorm.G[Invite](m.db).
+																		Where("channel_id = ?", channel.ID).
+																		Delete(context.Background())
+																	if(err!=nil){
+																		sendIslebotMessage(&m, fmt.Sprintf("Whilst making #%s public, invites could not be deleted", channel.ID))
+																	}
+																	sendIslebotMessage(&m, fmt.Sprintf("#%s is now public", channel.ID))
+																	m.app.mu.Lock()
+																	m.app.channels[channel.ID].Public = true
+																	m.app.channelMemberListCache[channel.ID].offlineMemberCount = len(m.app.channelMemberListCache[channel.ID].offlineMembers)
+																	m.app.channelMemberListCache[channel.ID].offlineMembers=make(map[string]string)
+																	m.app.mu.Unlock()
+
+
+																	m.app.mu.RLock()
+																	// Update member list for everyone in it
+																	for _, v := range m.app.channelMemberListCache[channel.ID].onlineMembers {
+																		if(v.currentChannelId==channel.ID){
+																			go v.prog.Send(channelMemberListMsg(m.app.channelMemberListCache[channel.ID]))
+																		}
+																	}
+																	m.app.mu.RUnlock()
+																}else{
+																	sendIslebotMessage(&m, fmt.Sprintf("Sorry but an error occured whilst processing your command"))
+																}
+															}else{
+																sendIslebotMessage(&m, fmt.Sprintf("This channel is already public. Anyone can join with /chan join %s", channel.ID))
+															}
+														}else{
+															sendIslebotMessage(&m, "You are not the owner of this channel")
+														}
+													}else{
+														sendIslebotMessage(&m, "Usage: /chan public")
+													}
+												case "private":
+													if(len(command) == 2){
+														m.app.mu.RLock()
+														channel := m.app.channels[m.viewChatModel.channels[m.viewChatModel.currentChannel].channelId]
+														m.app.mu.RUnlock()
+														if(channel.OwnerID==m.viewChatModel.id){
+															if(channel.Public){
+																var count int64
+																err := m.db.
+																	WithContext(context.Background()).
+																	Table("user_channels").
+																	Where("channel_id = ?", channel.ID).
+																	Count(&count).
+																	Error
+																
+																if(err==nil && count <= 300){
+																	var ids []string
+																	err := m.app.db.
+																		Table("user_channels").
+																		Where("channel_id = ?", channel.ID).
+																		Pluck("user_id", &ids).
+																		Error
+																	if(err==nil){
+																		_, err := gorm.G[Channel](m.app.db).Where("id = ?", channel.ID).
+																			Update(context.Background(), "public", false)
+																		if(err==nil){
+																			m.app.mu.Lock()
+																			m.app.channels[channel.ID].Public = false
+																			for _, v := range ids {
+																				m.app.channelMemberListCache[channel.ID].offlineMembers[v]=v
+																			}
+																			// No need to change offline count should be the exact same
+																			for k, _ := range m.app.channelMemberListCache[channel.ID].onlineMembers {
+																				delete(m.app.channelMemberListCache[channel.ID].offlineMembers, k)
+																			}
+																			for _, v := range m.app.channelMemberListCache[channel.ID].onlineMembers {
+																				if(v.currentChannelId==channel.ID){
+																					go v.prog.Send(channelMemberListMsg(m.app.channelMemberListCache[channel.ID]))
+																				}
+																			}
+																			m.app.mu.Unlock()
+																			sendIslebotMessage(&m, fmt.Sprintf("#%s is now private", channel.ID))
+																		}else{
+																			sendIslebotMessage(&m, "Sorry but an error occured whilst turning the channel private")
+																		}
+																		
+																	}else{
+																		sendIslebotMessage(&m, "Sorry but an error occured whilst turning the channel private")
+																	}
+
+																}else{
+																	sendIslebotMessage(&m, fmt.Sprintf("Sorry but you cannot make a channel with over 300 members private"))
+																}
+															}else{
+																sendIslebotMessage(&m, fmt.Sprintf("This channel is already private. You can invite members with /chan invite [user]"))
+															}
+														}else{
+															sendIslebotMessage(&m, "You are not the owner of this channel")
+														}
+													}else{
+														sendIslebotMessage(&m, "Usage: /chan private")
+													}
+												case "banner": 
+													m.app.mu.RLock()
+													channel := m.app.channels[m.viewChatModel.channels[m.viewChatModel.currentChannel].channelId]
+													m.app.mu.RUnlock()
+													if(channel.OwnerID==m.viewChatModel.id){
+														banner := m.viewChatModel.textarea.Value()[13:]
+														log.Info(banner)
+														blen := BannerWidth(banner)
+														if(blen>=2 && blen<=200){
+
+															_, err := gorm.G[Channel](m.app.db).Where("id = ?", channel.ID).
+																Update(context.Background(), "banner", banner)
+															if(err==nil){
+																m.app.mu.Lock()
+																m.app.channels[channel.ID].Banner=banner
+																m.app.mu.Unlock()
+
+																m.app.mu.RLock()
+																// Update user banners
+																for _, v := range m.app.channelMemberListCache[channel.ID].onlineMembers {
+																	go v.prog.Send(newBannerMsg(banner))
+																}
+																m.app.mu.RUnlock()
+															}else{
+																sendIslebotMessage(&m, "Sorry but an error occured whilst editing the banner")
+															}
+														}else{
+															sendIslebotMessage(&m, "Banner is too small/large")
+														}
+													}else{
+														sendIslebotMessage(&m, "You are not the owner of this channel")
 													}
 												default:
 													sendIslebotMessage(&m, chanHelpMsg)
@@ -1565,7 +1723,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					}
 				}
 			
-
+			case newBannerMsg:
+				m.viewChatModel.channelBanner = string(msg)
+				updateUserList(&m)
 
 			case tea.WindowSizeMsg:
 				// m.windowHeight = msg.Height

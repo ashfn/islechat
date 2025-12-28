@@ -16,7 +16,7 @@ import (
 	"sync"
 	"syscall"
 	"time"
-	"net/http"
+	// "net/http"
 	"github.com/charmbracelet/bubbles/cursor"
 	"github.com/charmbracelet/bubbles/textarea"
 	"github.com/charmbracelet/bubbles/textinput"
@@ -479,16 +479,16 @@ func (a *app) ProgramHandler(s ssh.Session) *tea.Program {
 
 func main() {
 
-	go func(){
-		fs := http.FileServer(http.Dir("./static"))
-		http.Handle("/", fs)
+	// go func(){
+	// 	fs := http.FileServer(http.Dir("./static"))
+	// 	http.Handle("/", fs)
 
-		log.Print("Listening on :3000...")
-		err := http.ListenAndServe(":3000", nil)
-		if err != nil {
-			log.Fatal(err)
-		}
-	}()
+	// 	log.Print("Listening on :3000...")
+	// 	err := http.ListenAndServe(":3000", nil)
+	// 	if err != nil {
+	// 		log.Fatal(err)
+	// 	}
+	// }()
 
 
 	dburl, ok := os.LookupEnv("DATABASE_URL")

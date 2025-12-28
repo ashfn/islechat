@@ -10,7 +10,7 @@ Channel commands
 
 public channels auto joined
 
-global
+global  
 
 /channel banner       ⢤⣤⣀   lol         ⢀⠔⠉ ⠈⠑⠂⠄    ⢀⠔⠂ lol ⡏  ⡆  ⡄ ⠈ ⠢⣀        ⡇  ⡇  ⡇    ⠈⠳⡀      ⡇⢀⡀⠁         ⢣      ⢱ ⠙⠢⣀⡀  ⢀⡰⠂  ⢸       ⠡⡀  ⠈⠉⠉⠉    ⠇    ⢀⣀⡀ ⠈⠒⠢⠤⠤⣀⣀⡀⢀⡠⠊          ⠠⢄⣀⡀     ⠸⡄    lol        lol    
 === THIS CAR JOURNEY ===
@@ -24,15 +24,15 @@ global
 
 
 [x] new|make|create <name> -> name is optional but makes a new channel with you as the owner
-[x] public -> makes the current channel public if you are the owner of it (anyone can join)
+[x] public -> makes the current channel pu/chan banner  ⢀⡤⠖⠲⢄ ⣠⠤⠶⠲⢤         ⢮   ⢸ ⢳⡀  ⣸          ⠓⠒⠚⢹  ⡏⠒⠉⠁             ⢸⡀ ⢳                 ⡇ ⢸                 ⣇ ⣸                 ⢹⢹⡸                 ⠘⠾⠃                 ⠸⢠                   ⠘ ⡄         blic if you are the owner of it (anyone can join)
 [x] private -> makes the current channel private if you are the owner of it (invite only)
 [x] invite <user> -> invites the user to the channel if it is private (shows error if public or not owner)
 [x] uninvite <user> -> revokes a users invite to the channel (shows error if public or not owner)
 [x] join <channel> -> joins the channel if it is public or you are invited
-[] leave -> leaves the current channel if you are not the owner and its not global
+[x] leave -> leaves the current channel if you are not the owner and its not global
 [] kick <user> -> kicks the user from the channel if your the owner
-[] ban <user> -> bans he user from the channel (only works if the channel is public)
-[] unban <user> -> duh
+- not for now [] ban <user> -> bans he user from the channel (only works if the channel is public)
+- not for now [] unban <user> -> duh
 [] delete -> deletes the channel if your the owner
 [x] banner <text> changes the banner of the channel
 
@@ -53,7 +53,7 @@ Only show offline users in private channels
 
 [] keybinds show at the bottom and are context based
 
-
+[] timezones and ip geolocation to auto set timezone
 
 Web page paths
 / main portal

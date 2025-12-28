@@ -1,0 +1,269 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>isle.chat</title>
+    <style>
+        :root {
+            --bg: #020617;
+            --surface: #0f172a;
+            --border: #1e293b;
+            --text: #e2e8f0;
+            --text-dim: #94a3b8;
+            --accent: #38bdf8;
+            --accent-glow: rgba(56, 189, 248, 0.15);
+            --font-mono: "SF Mono", Menlo, Consolas, monospace;
+            --font-sans: system-ui, -apple-system, sans-serif;
+        }
+        * { box-sizing: border-box; }
+        body {
+            background-color: var(--bg);
+            background-image: 
+                radial-gradient(circle at 50% 0%, #1e293b 0%, transparent 75%),
+                radial-gradient(circle at 85% 30%, rgba(56, 189, 248, 0.08) 0%, transparent 50%);
+            color: var(--text);
+            font-family: var(--font-sans);
+            margin: 0;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            min-height: 100vh;
+            padding: 80px 20px;
+        }
+        main {
+            width: 100%;
+            max-width: 720px;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 40px;
+        }
+        header {
+            text-align: center;
+            display: flex;
+            flex-direction: column;
+            gap: 16px;
+            margin-bottom: 8px;
+        }
+        h1 {
+            font-size: 3.5rem;
+            font-weight: 800;
+            margin: 0;
+            letter-spacing: -0.03em;
+            background: linear-gradient(to bottom right, #fff, #94a3b8);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }
+        p.sub {
+            color: var(--text-dim);
+            font-size: 1.25rem;
+            margin: 0;
+            font-weight: 400;
+        }
+
+        .cmd-container {
+            width: 100%;
+            max-width: 500px;
+            position: relative;
+        }
+        .cmd-container::before {
+            content: '';
+            position: absolute;
+            inset: -1px;
+            background: linear-gradient(90deg, var(--accent), #818cf8);
+            border-radius: 12px;
+            opacity: 0.3;
+            filter: blur(8px);
+            z-index: 0;
+        }
+        .cmd-row {
+            position: relative;
+            z-index: 1;
+            display: flex;
+            gap: 16px;
+            align-items: center;
+            background: rgba(15, 23, 42, 0.9);
+            backdrop-filter: blur(8px);
+            padding: 16px 20px;
+            border-radius: 12px;
+            border: 1px solid rgba(255,255,255,0.1);
+            font-family: var(--font-mono);
+            font-size: 1.1rem;
+            box-shadow: 0 4px 20px -5px rgba(0,0,0,0.5);
+        }
+        .cmd-row code {
+            flex: 1;
+            color: var(--text);
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+        .prompt {
+            color: var(--text-dim);
+            user-select: none;
+        }
+        .user {
+            color: var(--accent);
+        }
+        .copy-btn {
+            background: transparent;
+            border: 1px solid var(--border);
+            color: var(--text-dim);
+            cursor: pointer;
+            padding: 8px;
+            border-radius: 8px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            transition: all 0.2s;
+        }
+        .copy-btn:hover {
+            background: rgba(255,255,255,0.05);
+            color: #fff;
+            border-color: var(--text-dim);
+        }
+        .copy-btn:active {
+            transform: scale(0.95);
+        }
+
+        .player-wrapper {
+            width: 100%;
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            overflow: hidden;
+            background: #000;
+            box-shadow: 0 24px 48px -12px rgba(0, 0, 0, 0.5);
+        }
+
+        .info-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+            gap: 20px;
+            width: 100%;
+            padding: 0 10px;
+        }
+        .info-item {
+            background: rgba(30, 41, 59, 0.4);
+            border: 1px solid rgba(255,255,255,0.05);
+            border-radius: 12px;
+            padding: 20px;
+        }
+        .info-item h3 {
+            font-size: 0.9rem;
+            color: #fff;
+            margin: 0 0 8px 0;
+            font-weight: 600;
+        }
+        .info-item p {
+            margin: 0;
+            font-size: 0.95rem;
+            line-height: 1.5;
+            color: var(--text-dim);
+        }
+        .info-item code {
+            font-family: var(--font-mono);
+            font-size: 0.85em;
+            background: rgba(0,0,0,0.3);
+            padding: 2px 5px;
+            border-radius: 4px;
+            color: var(--accent);
+        }
+
+        .footer {
+            margin-top: 20px;
+            color: var(--text-dim);
+            font-size: 0.9rem;
+        }
+        a {
+            color: var(--accent);
+            text-decoration: none;
+            border-bottom: 1px solid transparent;
+            transition: all 0.2s;
+        }
+        a:hover {
+            color: #7dd3fc;
+            border-bottom-color: #7dd3fc;
+        }
+        .asciinema-player-wrapper {
+            width: 100%;
+        }
+    </style>
+</head>
+<body>
+    <main>
+        <header>
+            <h1>isle.chat</h1>
+            <p class="sub">SSH-powered chat from your terminal</p>
+        </header>
+
+        <div class="cmd-container">
+            <div class="cmd-row">
+                <code>
+                    <span class="prompt">$</span>
+                    <span>ssh <span class="user">username</span>@isle.chat</span>
+                </code>
+                <button class="copy-btn" id="copy-btn" aria-label="Copy command" title="Copy command">
+                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+                </button>
+            </div>
+        </div>
+
+        <div class="player-wrapper">
+             <a href="https://asciinema.org/a/zwZTnzq94lD49ik8cOhAf86H5" target="_blank" rel="noreferrer">
+                 <img src="https://asciinema.org/a/zwZTnzq94lD49ik8cOhAf86H5.svg" alt="isle.chat demo" style="display:block;width:100%;height:auto;border:0;" />
+             </a>
+        </div>
+
+        <div class="info-grid">
+            <div class="info-item">
+                <h3>Account Registration</h3>
+                <p>An account is created for you the first time you connect. Enter your desired password when prompted; it is hashed and never stored in plain text.</p>
+            </div>
+            <div class="info-item">
+                <h3>Choose Your Handle</h3>
+                <p>Replace <code>username</code> in the SSH command with your desired display name.</p>
+            </div>
+        </div>
+
+        <div class="footer">
+            Need channel art? <a href="banner.html">Open banner editor</a>
+        </div>
+    </main>
+
+    <script>
+        const btn = document.getElementById('copy-btn');
+        const text = 'ssh username@isle.chat';
+        
+        btn.addEventListener('click', async () => {
+            try {
+                if (navigator.clipboard && navigator.clipboard.writeText) {
+                    await navigator.clipboard.writeText(text);
+                } else {
+                    const ta = document.createElement('textarea');
+                    ta.value = text;
+                    ta.style.position = 'fixed';
+                    ta.style.opacity = '0';
+                    document.body.appendChild(ta);
+                    ta.focus();
+                    ta.select();
+                    document.execCommand('copy');
+                    document.body.removeChild(ta);
+                }
+                
+                // Show success icon
+                const originalContent = btn.innerHTML;
+                btn.innerHTML = '<svg width=\"20\" height=\"20\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"#4ade80\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\"><polyline points=\"20 6 9 17 4 12\"></polyline></svg>';
+                btn.style.borderColor = '#4ade80';
+                
+                setTimeout(() => {
+                    btn.innerHTML = originalContent;
+                    btn.style.borderColor = '';
+                }, 2000);
+            } catch (err) {
+                console.error('Failed to copy', err);
+            }
+        });
+    </script>
+</body>
+</html>

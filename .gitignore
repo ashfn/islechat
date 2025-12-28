@@ -1,0 +1,8 @@
+.env
+go.sum
+islechat
+run.sh
+test.db
+theme.json
+todo.txt
+.ssh

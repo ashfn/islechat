@@ -1,0 +1,68 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: isle-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: islechat
+      POSTGRES_USER: islechat
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - isle-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U islechat"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp
+      - /var/run/postgresql
+
+  isle-chat:
+    # build:
+    #   context: .
+    #   dockerfile: Dockerfile
+    image: ashfn0/islechat
+    container_name: islechat
+    restart: unless-stopped
+    tty: true
+    stdin_open: true
+    ports:
+      - "22:2222"
+    environment:
+      DATABASE_URL: host=postgres user=islechat password=${DB_PASSWORD} dbname=islechat port=5432 sslmode=disable
+      LOG_LEVEL: info
+      CLICOLOR_FORCE: 1
+      COLORTERM: truecolor
+      TERM: xterm-256color
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - isle-network
+    # Security hardening
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE  # Only if binding to port < 1024
+    tmpfs:
+      - /tmp
+    volumes:
+          - ./ssh_keys/id_ed25519:/app/.ssh/id_ed25519:ro   # <-- ADD THIS LINE
+
+volumes:
+  postgres_data:
+    driver: local
+
+networks:
+  isle-network:
+    driver: bridge

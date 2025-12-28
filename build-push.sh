@@ -7,12 +7,34 @@ TAG="latest"
 FULL_IMAGE="$DOCKER_USERNAME/$IMAGE_NAME:$TAG"
 PLATFORM="linux/amd64"
 
-echo "=== Creating/reusing buildx builder for better emulation ==="
-docker buildx create --use --name cross-builder --driver docker-container --bootstrap || true
+echo "=== Setting up buildx builder (reusing if exists) ==="
 
-echo "=== Building and pushing with buildx (better amd64 emulation) ==="
-docker buildx build --platform "$PLATFORM" \
+# Remove old builder if it exists, then recreate fresh (simplest & most reliable)
+docker buildx rm fast-builder || true
+docker buildx create --use --name fast-builder \
+  --driver docker-container \
+  --bootstrap \
+  --config /dev/stdin <<EOF
+[worker.docker-container]
+  cpus = $(sysctl -n hw.logicalcpu)
+  memory = 8589934592  # 8GB
+  [[features]]
+    binfmt = true
+EOF
+
+echo "Builder ready: using $(sysctl -n hw.logicalcpu) cores + 8GB RAM"
+
+echo "=== Building and pushing $FULL_IMAGE ($PLATFORM) ==="
+
+docker buildx build \
+  --platform "$PLATFORM" \
+  --push \
+  --pull \
+  --progress=plain \
   -t "$FULL_IMAGE" \
-  --push .   # --push sends directly to Hub (no local image needed)
+  .
 
-echo "=== Done! Image pushed: $FULL_IMAGE ==="
+echo ""
+echo "=== SUCCESS! ==="
+echo "Image pushed: $FULL_IMAGE"
+echo "Check it here: https://hub.docker.com/r/$DOCKER_USERNAME/$IMAGE_NAME/tags"

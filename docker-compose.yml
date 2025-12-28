@@ -36,6 +36,7 @@ services:
     stdin_open: true
     ports:
       - "22:2222"
+      - "80:3000"
     environment:
       DATABASE_URL: host=postgres user=islechat password=${DB_PASSWORD} dbname=islechat port=5432 sslmode=disable
       LOG_LEVEL: info

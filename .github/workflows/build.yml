@@ -8,6 +8,7 @@ on:
 jobs:
   docker:
     runs-on: ubuntu-latest
+    environment: main  # <-- reference your GitHub Environment here
 
     env:
       DOCKER_USERNAME: ashfn0

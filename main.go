@@ -1913,10 +1913,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				updateUserList(&m)
 			
 			case chatMsg:
-				if(msg.channel==m.viewChatModel.channels[m.viewChatModel.currentChannel].channelId){
-					m.viewChatModel.messages = append(m.viewChatModel.messages, msg)
-					updateChatLines(&m)
-				}
+				m.app.mu.RLock()
+				m.viewChatModel.messages = m.app.messages[m.viewChatModel.channels[m.viewChatModel.currentChannel].channelId]
+				m.app.mu.RUnlock()
+				updateChatLines(&m)
+				// if(msg.channel==){
+				// 	m.viewChatModel.messages = append(m.viewChatModel.messages, msg)
+				// }
 			case channelList:
 				log.Info("Received channel list: ",msg)
 				m.viewChatModel.channels = msg.channels

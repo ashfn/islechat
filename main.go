@@ -1298,7 +1298,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 											switch command[1]{
 												case "create":
 													if(len(command)==3){
-														newChannelName := command[2]
+														newChannelName := strings.ToLower(command[2])
 
 														// Check if the name exists
 														channel,ok := m.app.channels[newChannelName]
@@ -1958,6 +1958,15 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 							if(err!=nil){
 								m.viewRegistrationModel.feedbackViewport.SetContent("Error creating account (1)")
+								return m,nil
+							}
+
+							_, err = gorm.G[User](m.db).
+								Where("LOWER(name) = ?", strings.ToLower(newUsername)).
+								First(context.Background())
+
+							if(err!=nil){
+								m.viewRegistrationModel.feedbackViewport.SetContent("Username already exists")
 								return m,nil
 							}
 

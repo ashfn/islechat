@@ -82,6 +82,12 @@ type app struct {
 	sessionUsernames map[string]string
 }
 
+type serverConfig struct {
+	serverName string
+	adminUsername string
+	globalBanner string
+	announcementChannel string
+}
 
 // A session for a user
 type userSession struct {
@@ -151,18 +157,20 @@ func (a *app) sendMessage(msg chatMsg) {
 		Time: msg.time,
 		ChannelID: msg.channel,
 	})
-	a.messages[msg.channel] = append(a.messages[msg.channel], msg)
 	if(err==nil){
 		a.mu.Lock()
-		for _, p := range a.sessions {
-			if(p.currentChannelId==msg.channel){
-				go p.prog.Send(msg)
-			}
-		}
+		a.messages[msg.channel] = append(a.messages[msg.channel], msg)
 		a.mu.Unlock()
+		a.mu.RLock()
+
+		for _, p := range a.channelMemberListCache[msg.channel].onlineMembers {
+			go p.prog.Send(msg)
+		}
+
+		a.mu.RUnlock()
 	}else{
 		log.Errorf("Error sending msg in %s", msg.channel)
-		// Handle error or some shit
+
 	}
 }
 
@@ -250,8 +258,6 @@ func newApp(db *gorm.DB) *app {
 				a.channelMemberListCache[v.ID].offlineMembers[u.ID]=u.ID
 			}
 		}
-		log.Infof("===== %s =====", v.ID)
-		log.Info(a.channelMemberListCache[v.ID].offlineMembers)
 	}
 
 
@@ -380,7 +386,7 @@ func (a *app) CleanupMiddleware(next ssh.Handler) ssh.Handler {
 
 			username, ok := a.sessionUsernames[s.Context().SessionID()]
 			if(!ok){
-				log.Error(fmt.Sprintf("Logged out user left: %s", s.Context().SessionID()))
+
 				// User wasn't logged in
 				// Just clean them up from the sessions list
 				a.mu.Lock()
@@ -388,7 +394,7 @@ func (a *app) CleanupMiddleware(next ssh.Handler) ssh.Handler {
 				delete(a.sessionUsernames, s.Context().SessionID())
 				a.mu.Unlock()
 			}else{
-				log.Error(fmt.Sprintf("Logged in user left: %s", username))
+
 
 				// Update channel list for all their channels
 				updateChannelMemberList(updateChannelMemberListParameters{
@@ -458,7 +464,7 @@ func (a *app) ProgramHandler(s ssh.Session) *tea.Program {
 		}))
 	}else{
 		// We give it a temporary 'username' using the session id
-		log.Info(fmt.Sprintf("Sessid: %s", s.Context().SessionID()))
+
 		a.mu.Lock()
 		a.sessions[s.Context().SessionID()]=&userSession{
 			prog: p,
@@ -479,6 +485,8 @@ func (a *app) ProgramHandler(s ssh.Session) *tea.Program {
 
 func main() {
 
+
+	log.Info("Starting :)")
 	// go func(){
 	// 	fs := http.FileServer(http.Dir("./static"))
 	// 	http.Handle("/", fs)
@@ -671,8 +679,6 @@ func joinedHandleChannels(m *model) []userChannelState  {
 
 
 	if(err!=nil){
-		// That would be really weird if we ended up here
-		log.Error("Error was NOT NIL!")
 		log.Error(err)
 		return []userChannelState{}
 	}
@@ -690,7 +696,7 @@ func joinedHandleChannels(m *model) []userChannelState  {
 	// Adding the user to online member list for their channels
 	m.app.mu.Lock()
 	for _, channel := range channelIDs {
-		log.Info(fmt.Sprintf("Chan: %s, id: %s", channel, m.viewChatModel.id))
+
 		// m.app.channelMembers[channel][m.viewChatModel.id]=m.app.sessions[m.viewChatModel.id]
 		m.app.sessions[m.viewChatModel.id].joinedChannels = append(m.app.sessions[m.viewChatModel.id].joinedChannels, channel)
 	}
@@ -837,7 +843,7 @@ func initialModel(a *app, width int, height int, sess ssh.Session) model {
 			passwordInput.SetValue(pass)
 		}
 
-		log.Info(fmt.Sprintf("Sessid: %s", sess.Context().SessionID()))
+
 		
 		return model{
 
@@ -928,8 +934,9 @@ func updateChannelList(m *model){
 
 	currentChannel := lipgloss.NewStyle().Background(lipgloss.Color("240")).Foreground(lipgloss.Color("15"))
 	currentChannelFocused := lipgloss.NewStyle().Background(lipgloss.Color("84")).Foreground(lipgloss.Color("240"))
-	otherChannel := lipgloss.NewStyle().Foreground(lipgloss.Color("15"))
-
+	otherChannel := lipgloss.NewStyle().Foreground(lipgloss.Color("243"))
+	otherChannelUnread := lipgloss.NewStyle().Foreground(lipgloss.Color("15"))
+	notificationCount := lipgloss.NewStyle().Foreground(lipgloss.Color("87"))
 	for _, v := range m.viewChatModel.channels {
 		if(m.viewChatModel.channels[m.viewChatModel.currentChannel]==v){
 			if(focused){
@@ -938,7 +945,17 @@ func updateChannelList(m *model){
 				channelListText+=currentChannel.Render(fmt.Sprintf("# %-18s", v.channelId))+"\n"
 			}
 		}else{
-			channelListText+=otherChannel.Render(fmt.Sprintf("# %-18s", v.channelId))+"\n"
+			if(v.unread>0){
+				if(v.unread>9){
+					channelListText+=otherChannelUnread.Render(fmt.Sprintf("# %-13s  ", v.channelId))+
+					notificationCount.Render("9+ ")+"\n"
+				}else{
+					channelListText+=otherChannelUnread.Render(fmt.Sprintf("# %-13s   ", v.channelId))+
+					notificationCount.Render(fmt.Sprintf("%d  ", v.unread))+"\n"
+				}
+			}else{
+				channelListText+=otherChannel.Render(fmt.Sprintf("# %-18s", v.channelId))+"\n"
+			}
 		}
 	}
 
@@ -1701,7 +1718,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 													if(channel.OwnerID==m.viewChatModel.id){
 														if(len(m.viewChatModel.textarea.Value())>12){
 															banner := m.viewChatModel.textarea.Value()[13:]
-															log.Info(banner)
 															blen := BannerWidth(banner)
 															if(blen>=2 && blen<=200){
 																_, err := gorm.G[Channel](m.app.db).Where("id = ?", channel.ID).
@@ -1714,7 +1730,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 																	m.app.mu.RLock()
 																	// Update user banners
 																	for _, v := range m.app.channelMemberListCache[channel.ID].onlineMembers {
-																		go v.prog.Send(newBannerMsg(banner))
+																		if(v.currentChannelId==channel.ID){
+																			go v.prog.Send(newBannerMsg(banner))
+																		}
 																	}
 																	m.app.mu.RUnlock()
 																}else{
@@ -1824,6 +1842,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 							m.app.mu.Lock()
 							m.app.sessions[m.viewChatModel.id].currentChannelId=m.viewChatModel.channels[m.viewChatModel.currentChannel].channelId
 							m.viewChatModel.memberList=m.app.channelMemberListCache[m.viewChatModel.channels[m.viewChatModel.currentChannel].channelId]
+							m.viewChatModel.channels[m.viewChatModel.currentChannel].unread=0
 							m.app.mu.Unlock()
 							updateChannelList(&m)
 							updateUserList(&m)
@@ -1843,6 +1862,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 							m.app.mu.Lock()
 							m.app.sessions[m.viewChatModel.id].currentChannelId=m.viewChatModel.channels[m.viewChatModel.currentChannel].channelId
 							m.viewChatModel.memberList=m.app.channelMemberListCache[m.viewChatModel.channels[m.viewChatModel.currentChannel].channelId]
+							m.viewChatModel.channels[m.viewChatModel.currentChannel].unread=0
 							m.app.mu.Unlock()
 							updateChannelList(&m)
 							updateUserList(&m)
@@ -1869,7 +1889,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						updatedChatFocus(&m)
 					}else if(msg.Type == tea.KeyRight && m.viewChatModel.focus == FocusedBoxChatInput){
 						info := m.viewChatModel.textarea.LineInfo()
-						log.Info(fmt.Sprintf("%d %d", info.CharOffset, info.CharWidth))
 						// Only change focus if the cursor is at the end of the line
 						if(info.CharOffset>=info.CharWidth-1){
 							m.viewChatModel.focus = FocusedBoxUserList
@@ -1888,8 +1907,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						updatedChatFocus(&m)
 					}else if(msg.Type == tea.KeyLeft && m.viewChatModel.focus == FocusedBoxChatInput){
 						info := m.viewChatModel.textarea.LineInfo()
-						// log.Info(fmt.Sprintf("%d %d", info.CharOffset, info.CharWidth))
-						// Only change focus if the cursor is at the end of the line
 						if(info.RowOffset==0 && info.CharOffset==0){
 							m.viewChatModel.focus = FocusedBoxChannelList
 							updatedChatFocus(&m)
@@ -1913,31 +1930,37 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				updateUserList(&m)
 			
 			case chatMsg:
-				m.app.mu.RLock()
-				m.viewChatModel.messages = m.app.messages[m.viewChatModel.channels[m.viewChatModel.currentChannel].channelId]
-				m.app.mu.RUnlock()
+				// m.app.mu.RLock()
+				// m.viewChatModel.messages = m.app.messages[m.viewChatModel.channels[m.viewChatModel.currentChannel].channelId]
+				// m.app.mu.RUnlock()
+				if(msg.channel==m.viewChatModel.channels[m.viewChatModel.currentChannel].channelId){
+					m.viewChatModel.messages = append(m.viewChatModel.messages, msg)
+				}else{
+					for i,v := range m.viewChatModel.channels{
+						if(v.channelId==msg.channel){
+							m.viewChatModel.channels[i].unread++
+						}
+					}
+				}
+				updateChannelList(&m)
 				updateChatLines(&m)
-				// if(msg.channel==){
-				// 	m.viewChatModel.messages = append(m.viewChatModel.messages, msg)
-				// }
 			case channelList:
-				log.Info("Received channel list: ",msg)
 				m.viewChatModel.channels = msg.channels
 				if(msg.firstjoin){
-					sendIslebotMessagePermanent(m.app, fmt.Sprintf("A new user joined for the first time! Welcome @%s", m.viewChatModel.id), "global")
-					m.viewChatModel.messages = append(m.viewChatModel.messages, chatMsg{
-						sender:  "islebot",
-						text:    "Welcome to isle.chat! You are in the #global channel but you can create and join your own channels using /chan. For all commands run /help, for news and updates /chan join news. Enjoy your stay!",
-						time:    time.Now(),
-						channel: "global",
-					})
-					updateChatLines(&m)	
+					sendIslebotMessagePermanent(m.app, fmt.Sprintf("A new user joined for the first time! Welcome @%s. Run /help for information", m.viewChatModel.id), "global")
+					// sendIslebotMessage(&m, "Welcome to isle.chat! You are in the #global channel but you can create and join your own channels using /chan. For all commands run /help, for news and updates /chan join news. Enjoy your stay!")
+					// m.viewChatModel.messages = append(m.viewChatModel.messages, chatMsg{
+					// 	sender:  "islebot",
+					// 	text:    ,
+					// 	time:    time.Now(),
+					// 	channel: "global",
+					// })
+					// updateChatLines(&m)	
 				}
 				updateChannelList(&m)
 			
 			case channelMemberListMsg:
 				m.viewChatModel.memberList=msg
-				log.Info("Received member list!")
 				updateUserList(&m)
 			
 			case tea.QuitMsg:
@@ -2202,9 +2225,6 @@ func RegistrationBox() BoxWithLabel {
 		BoxStyleUnfocused: lipgloss.NewStyle().
 			Border(lipgloss.NormalBorder()).
 			BorderForeground(lipgloss.Color("240")),
-
-		// You could, of course, also set background and foreground colors here 
-		// as well.
 		LabelStyle: lipgloss.NewStyle().
 			Foreground(lipgloss.Color("240")).
 			Bold(true).
@@ -2256,13 +2276,6 @@ func (b BoxWithLabel) Render(label, content string, width int, focused bool) str
 
 	// Stack the pieces
 	return top + "\n" + bottom
-}
-
-func max(a, b int) int {
-	if a > b {
-		return a
-	}
-	return b
 }
 
 func (m model) View() string {
@@ -2328,9 +2341,8 @@ func (m model) View() string {
 				Foreground(lipgloss.Color("121"))
 
 			titleRegBox := RegistrationBox()
-
 			return m.viewChatModel.alert.Render(lipgloss.JoinVertical(lipgloss.Right, 
-				"isle.chat registration",
+				"isle.chat registration   ",
 				titleRegBox.Render("username", usernameBox, 26, m.viewRegistrationModel.FocusedBox==RegistrationUsernameFocused),
 				titleRegBox.Render("password", passwordBox, 26, m.viewRegistrationModel.FocusedBox==RegistrationPasswordFocused),
 				titleRegBox.Render("confirm", passwordConfirmBox, 26, m.viewRegistrationModel.FocusedBox==RegistrationPasswordConfirmFocused),
@@ -2342,6 +2354,7 @@ func (m model) View() string {
 					}
 				}(),
 				lipgloss.NewStyle().Foreground(lipgloss.Color("9")).Render(m.viewRegistrationModel.feedbackViewport.View()),
+				lipgloss.NewStyle().Foreground(lipgloss.Color("243")).Render("Use arrow keys/tab+enter  "),
 			)) 
 
 		default:

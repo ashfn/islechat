@@ -383,21 +383,10 @@ func (a *app) CleanupMiddleware(next ssh.Handler) ssh.Handler {
 					userId: username,
 					change: UserChannelOffline,
 				})
-
-				// a.mu.Lock()
-				// for _,v := range a.sessions[username].joinedChannels{
-				// 	delete(a.channelMembers[v], username)
-				// }
-				// a.mu.Unlock()
-				// for _,v := range a.sessions[username].joinedChannels{
-				// 	updateChannelMemberList(a, v)
-				// }
 				a.mu.Lock()
 				delete(a.sessions, username)
 				a.mu.Unlock()
 			}
-
-			// The s.User() cannot be used here at all because someone can obviously be signing up 
         }()
 	}
 }
@@ -423,7 +412,6 @@ func (a *app) ProgramHandler(s ssh.Session) *tea.Program {
 	}
 
     opts := append([]tea.ProgramOption{}, bubbletea.MakeOptions(s)...)
-	// opts = append(opts, tea.WithP(tea.ColorMode256))
     p := tea.NewProgram(model, opts...)
 
 
@@ -543,8 +531,6 @@ func main() {
 			Banner: `                              ⢶⣄              ⠉⠛⢓⣶⣦⢿⣦⣴⡖⠛⠋          ⠚⠋⠁⢠⣿⠃⠉⠉⠛⠒⠂  isle.chat⢀⣾⠇        v0.0.0   ⣼⡟         #global ⢰⣿⠁          ⢀⣠⣤⣤⣴⣶⣶⣾⣯⣤⣤⣤⣤⣤⣀⣀   ⠰⠿⠿⢿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⡿⠿⠿⠦                     `,
 			Public: true,
 		},}) 
-
-	// db.AutoMigrate(&Product{})
 
 	app := newApp(db, config)
 

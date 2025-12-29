@@ -176,6 +176,7 @@ func (a *app) sendMessage(msg chatMsg) {
 
 		for _, p := range a.channelMemberListCache[msg.channel].onlineMembers {
 			if(p.loggedIn){
+				log.Info("MSG-SENT")
 				go p.prog.Send(msg)
 			}
 		}
@@ -983,7 +984,14 @@ func updateChatLines(m *model) {
 }
 
 func reloadMessagesChannelSwitch(m *model){
-	m.viewChatModel.messages = m.app.messages[m.viewChatModel.channels[m.viewChatModel.currentChannel].channelId]
+	channelId := m.viewChatModel.channels[m.viewChatModel.currentChannel].channelId
+	
+	m.app.mu.RLock()
+	originalMsgs := m.app.messages[channelId]
+	m.viewChatModel.messages = make([]chatMsg, len(originalMsgs))
+	copy(m.viewChatModel.messages, originalMsgs)
+	m.app.mu.RUnlock()
+	
 	updateChatLines(m)
 }
 
@@ -1178,12 +1186,13 @@ func updateChannelMemberList(params updateChannelMemberListParameters){
 }
 
 func sendIslebotMessage(m *model, msg string){
-	m.viewChatModel.messages = append(m.viewChatModel.messages, chatMsg{
+	localMsg := chatMsg{
 		sender: m.app.config.BotUsername,
 		text: msg,
 		time: time.Now(),
 		channel: m.viewChatModel.channels[m.viewChatModel.currentChannel].channelId,
-	})
+	}
+	m.viewChatModel.messages = append(m.viewChatModel.messages, localMsg)
 	updateChatLines(m)
 }
 
@@ -1962,7 +1971,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 							}
 
 							_, err = gorm.G[User](m.db).
-								Where("LOWER(name) = ?", strings.ToLower(newUsername)).
+								Where("LOWER(id) = ?", strings.ToLower(newUsername)).
 								First(context.Background())
 
 							if(err==nil){
@@ -1973,7 +1982,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 							err = gorm.G[User](m.db).Create(context.Background(), &User{
 								ID: newUsername,
 								Password: hashedPass,
-								Channels: []Channel{*m.app.channels["global"]},
+								Channels: []Channel{},
 							})
 
 							if(err!=nil){

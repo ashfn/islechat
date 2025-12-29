@@ -15,7 +15,6 @@ services:
       - isle-network
     security_opt:
       - no-new-privileges:true
-    read_only: true
     tmpfs:
       - /tmp
       - /var/run/postgresql
@@ -32,7 +31,6 @@ services:
     ports:
       - "222:2222"
     environment:
-      DATABASE_URL: host=postgres user=islechat password=${DB_PASSWORD} dbname=islechat port=5432 sslmode=disable
       LOG_LEVEL: info
       CLICOLOR_FORCE: 1
       COLORTERM: truecolor
@@ -51,7 +49,8 @@ services:
     tmpfs:
       - /tmp
     volumes:
-          - ./ssh_keys/id_ed25519:/app/.ssh/id_ed25519:ro   # <-- ADD THIS LINE
+          - ./ssh_keys/id_ed25519:/home/islechat/app/.ssh/id_ed25519:ro   # <-- ADD THIS LINE
+          - ./config.toml:/home/islechat/config.toml
 
 volumes:
   postgres_data:

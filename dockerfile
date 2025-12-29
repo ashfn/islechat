@@ -1,12 +1,10 @@
-# syntax=docker/dockerfile:1
-
-# ============ Builder Stage ============
 FROM golang:1.25.5-alpine AS builder
 
 # Install dependencies needed for go build
 RUN apk add --no-cache git ca-certificates tzdata
 
 WORKDIR /app
+
 
 # Copy only go.mod and go.sum first — this enables Docker layer caching
 COPY go.mod go.sum ./
@@ -16,11 +14,10 @@ RUN go mod download && go mod verify
 
 # Now copy the full source code
 COPY . .
-
 # Build the binary for linux/amd64 (explicit for consistency)
 # Remove -ldflags if you want debug info; add them later for smaller binary if needed
-RUN GOOS=linux GOARCH=amd64 go build -o isle-chat .
-
+RUN apk add --no-cache gcc musl-dev
+RUN CGO_ENABLED=1 go build -o isle-chat .
 # ============ Runtime Stage ============
 FROM alpine:3.19
 

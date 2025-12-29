@@ -8,15 +8,12 @@ import (
 	"os/signal"
 	"slices"
 
-	// "slices"
 	"strings"
 
 	"unicode"
-	// "strings"
 	"sync"
 	"syscall"
 	"time"
-	// "net/http"
 	"github.com/charmbracelet/bubbles/cursor"
 	"github.com/charmbracelet/bubbles/textarea"
 	"github.com/charmbracelet/bubbles/textinput"
@@ -34,14 +31,13 @@ import (
 
     "go.dalton.dog/bubbleup"
 
-
-	// "github.com/charmbracelet/glamour"
+	"github.com/BurntSushi/toml"
 
 	humanize "github.com/dustin/go-humanize"
 
 	"regexp"
 
-	// "gorm.io/driver/sqlite"
+	"gorm.io/driver/sqlite"
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
@@ -49,20 +45,17 @@ import (
 	"golang.org/x/crypto/bcrypt"
 )
 
-const (
-	host = "0.0.0.0"
-	port = "2222"
-)
-
-// app contains a wish server and the list of running programs.
 type app struct {
 	*ssh.Server
-    // progs map[string]*tea.Program
+
+	config serverConfig
 	db *gorm.DB 
 	messages map[string][]chatMsg
 
 	// Only stores logged in users to prevent the same user logging in from multiple shells 
-	// Map from username -> session
+	// Map from username -> session OR 
+	//         sessionId -> session (if not logged in)
+
 	// will also include 
 	sessions map[string]*userSession
 
@@ -70,8 +63,7 @@ type app struct {
 
 	// Map from channel ids to channel object
 	channels map[string]*Channel
-	// Only the online members!
-	// channelMembers map[string]map[string]*userSession
+
 
 	// Cached channel memberlists
 	channelMemberListCache map[string]*channelMemberList
@@ -80,13 +72,32 @@ type app struct {
 	// Used for handling session disconnects
 	// If the user isn't logged in the username will be nil
 	sessionUsernames map[string]string
+
 }
 
 type serverConfig struct {
-	serverName string
-	adminUsername string
-	globalBanner string
-	announcementChannel string
+	Host string
+	Port string
+	ServerName string
+	AdminUsername string
+	BotUsername string
+	GlobalBanner string
+	AnnouncementChannel string
+	DefaultBanner string
+	WelcomeMessage string
+	FilterPublicMessages bool
+	RegistrationHeader string
+
+	// either "sqlite" or "postgres"
+	DatabaseMode string
+
+	PostgresHost string
+	PostgresUser string
+	PostgresPassword string
+	PostgresDBName string
+	PostgresPort string
+	PostgresSSL string
+
 }
 
 // A session for a user
@@ -96,7 +107,7 @@ type userSession struct {
 	loggedIn bool
 
 	// Used so we dont distribute the message to absolutely everyone
-	// Will be nil if not logged in
+	// Will be nil if not logged in (on registration page)
 	username string
 	currentChannelId string
 	joinedChannels []string
@@ -174,20 +185,6 @@ func (a *app) sendMessage(msg chatMsg) {
 	}
 }
 
-func (a *app) updateUserlists() {
-
-	// TEMPORARY USER LIST
-
-	users := make([]string, len(a.sessions))
-	i := 0
-	for u, _ := range a.sessions {
-		users[i] = u
-		i++
-	}
-	for _, sess := range a.sessions {
-		go sess.prog.Send(userlist(users))
-	}
-}
 
 func VPDisableScrolling(v *viewport.Model) {
 	v.KeyMap.Up.SetEnabled(false)
@@ -207,22 +204,11 @@ func VPEnableScrolling(v *viewport.Model) {
 	v.KeyMap.PageDown.SetEnabled(true)
 }
 
-func newApp(db *gorm.DB) *app {
+func newApp(db *gorm.DB, config serverConfig) *app {
 	a := new(app)
 	a.db = db
+	a.config=config
 
-
-
-	// r, err := glamour.NewTermRenderer(
-	// 	// glamour.WithStylePath("theme.json"),
-	// 	glamour.WithStandardStyle("dark"),
-	// )
-
-	// if err != nil {
-	// 	panic(err)
-	// }
-
-	// a.glamourRenderer = r
 	a.mu.Lock()
 	a.messages = make(map[string][]chatMsg)
 	a.channels = make(map[string]*Channel)
@@ -290,7 +276,7 @@ func newApp(db *gorm.DB) *app {
 	a.mu.Unlock()
 
 	s, err := wish.NewServer(
-		wish.WithAddress(net.JoinHostPort(host, port)),
+		wish.WithAddress(net.JoinHostPort(a.config.Host, a.config.Port)),
 		wish.WithHostKeyPath(".ssh/id_ed25519"),
 		wish.WithPasswordAuth(func(ctx ssh.Context, password string) bool {
 			username := ctx.User()
@@ -341,11 +327,6 @@ func newApp(db *gorm.DB) *app {
 
 		}),
 		wish.WithMiddleware(
-			func(next ssh.Handler) ssh.Handler {
-				return func(sess ssh.Session) {
-					// sess.Context().
-				}
-			},
 			a.CleanupMiddleware,
 			bubbletea.MiddlewareWithProgramHandler(a.ProgramHandler, termenv.TrueColor),
 			activeterm.Middleware(),
@@ -364,7 +345,7 @@ func (a *app) Start() {
 	var err error
 	done := make(chan os.Signal, 1)
 	signal.Notify(done, os.Interrupt, syscall.SIGINT, syscall.SIGTERM)
-	log.Info("Starting SSH server", "host", host, "port", port)
+	log.Info("Starting SSH server", "host", a.config.Host, "port", a.config.Port)
 	go func() {
 		if err = a.ListenAndServe(); err != nil {
 			log.Error("Could not start server", "error", err)
@@ -475,59 +456,97 @@ func (a *app) ProgramHandler(s ssh.Session) *tea.Program {
 		a.mu.Unlock()
 	}
 
-	// a
-
-
-	a.updateUserlists()
 
 	return p
 }
 
 func main() {
-
-
-	log.Info("Starting :)")
-	// go func(){
-	// 	fs := http.FileServer(http.Dir("./static"))
-	// 	http.Handle("/", fs)
-
-	// 	log.Print("Listening on :3000...")
-	// 	err := http.ListenAndServe(":3000", nil)
-	// 	if err != nil {
-	// 		log.Fatal(err)
-	// 	}
-	// }()
-
-
-	dburl, ok := os.LookupEnv("DATABASE_URL")
-	if !ok || dburl == "" {
-		log.Fatal("DATABASE_URL not set")
+	f := "config.toml"
+	if _, err := os.Stat(f); err != nil {
+		f = "config.toml"
 	}
 
-	db, err := gorm.Open(postgres.Open(dburl), &gorm.Config{})
-	// db, err := gorm.Open(sqlite.Open("test.db"), &gorm.Config{})
+	var config serverConfig
+	_, err := toml.DecodeFile(f, &config)
+
+	if(err!=nil){
+		log.Error("Could not parse invalid configuration.")
+        // Set defaults
+        config = serverConfig{
+			Host: "0.0.0.0",
+			Port: "2222",
+			ServerName: "isle.chat",
+			AdminUsername: "admin",
+			BotUsername: "islebot",
+			GlobalBanner: `                              ⢶⣄              ⠉⠛⢓⣶⣦⢿⣦⣴⡖⠛⠋          ⠚⠋⠁⢠⣿⠃⠉⠉⠛⠒⠂  isle.chat⢀⣾⠇        v0.0.0   ⣼⡟         #global ⢰⣿⠁          ⢀⣠⣤⣤⣴⣶⣶⣾⣯⣤⣤⣤⣤⣤⣀⣀   ⠰⠿⠿⢿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⡿⠿⠿⠦                     `,
+			AnnouncementChannel: "news",
+			DefaultBanner: `                              ⢶⣄              ⠉⠛⢓⣶⣦⢿⣦⣴⡖⠛⠋          ⠚⠋⠁⢠⣿⠃⠉⠉⠛⠒⠂  isle.chat⢀⣾⠇        v0.0.0   ⣼⡟         default ⢰⣿⠁          ⢀⣠⣤⣤⣴⣶⣶⣾⣯⣤⣤⣤⣤⣤⣀⣀   ⠰⠿⠿⢿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⡿⠿⠿⠦                     `,
+			WelcomeMessage: "A new user joined for the first time! Welcome @%s. Run /help for information and arrow keys to navigate",
+			FilterPublicMessages: false,
+			RegistrationHeader: "isle.chat registration   ",
+			DatabaseMode: "sqlite",
+			PostgresHost: "localhost",
+			PostgresUser: "islechat",
+			PostgresPassword: "password",
+			PostgresDBName: "islechat",
+			PostgresPort: "5432",
+			PostgresSSL: "disable",
+				
+        }
+
+        // Create default config file
+        f, err := os.Create("config.toml")
+        if err != nil {
+            log.Fatal(err)
+        }
+        defer f.Close()
+
+        if err := toml.NewEncoder(f).Encode(config); err != nil {
+            log.Fatal(err)
+        }
+
+        log.Fatal("Default config.toml created.")
+	}
+	var db *gorm.DB
+	
+	if(config.DatabaseMode=="sqlite"){
+		db, err = gorm.Open(sqlite.Open("islechat.db"), &gorm.Config{})
+	}else{
+		dburl := fmt.Sprintf("host=%s user=%s password=%s dbname=%s port=%s sslmode=%s",
+			config.PostgresHost,
+			config.PostgresUser,
+			config.PostgresPassword,
+			config.PostgresDBName,
+			config.PostgresPort,
+			config.PostgresSSL,
+		)
+		db, err = gorm.Open(postgres.Open(dburl), &gorm.Config{})
+	}
+
 	if err != nil {
+		log.Errorf("%s", err)
 		panic("failed to connect database")
 	}
+
 	db.AutoMigrate(&Message{}, &Channel{}, &User{}, &Invite{})
 
 	db.Clauses(clause.OnConflict{DoNothing: true}).Create(&[]User{
 		{
-			ID: "islebot",
+			ID: config.BotUsername,
 			Password: "",
 			Channels: make([]Channel, 0),
 		},}) 
 	db.Clauses(clause.OnConflict{DoNothing: true}).Create(&[]Channel{
 		{
 			ID: "global",
-			OwnerID: "islebot",
+			OwnerID: config.BotUsername,
 			Banner: `                              ⢶⣄              ⠉⠛⢓⣶⣦⢿⣦⣴⡖⠛⠋          ⠚⠋⠁⢠⣿⠃⠉⠉⠛⠒⠂  isle.chat⢀⣾⠇        v0.0.0   ⣼⡟         #global ⢰⣿⠁          ⢀⣠⣤⣤⣴⣶⣶⣾⣯⣤⣤⣤⣤⣤⣀⣀   ⠰⠿⠿⢿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⡿⠿⠿⠦                     `,
 			Public: true,
 		},}) 
 
 	// db.AutoMigrate(&Product{})
 
-	app := newApp(db)
+	app := newApp(db, config)
 
 
 	app.Start()
@@ -697,7 +716,6 @@ func joinedHandleChannels(m *model) []userChannelState  {
 	m.app.mu.Lock()
 	for _, channel := range channelIDs {
 
-		// m.app.channelMembers[channel][m.viewChatModel.id]=m.app.sessions[m.viewChatModel.id]
 		m.app.sessions[m.viewChatModel.id].joinedChannels = append(m.app.sessions[m.viewChatModel.id].joinedChannels, channel)
 	}
 	
@@ -738,36 +756,7 @@ func initialModel(a *app, width int, height int, sess ssh.Session) model {
 	ta.KeyMap.InsertNewline.SetEnabled(false)
 
 	previousMsgs := a.messages["global"]
-
-	// previousMsgs := []chatMsg{}
-	// msgs,err := gorm.G[Message](a.db).
-	// 	Order("time DESC").   // newest first
-	// 	Limit(100).            // last 30 rows
-	// 	Find(context.Background())
-
-	// if(err==nil){
-	// 	for _,v := range msgs{
-	// 		previousMsgs = append(previousMsgs, chatMsg{
-	// 			sender: v.Sender,
-	// 			text: v.Content,
-	// 			time: v.Time,
-	// 		})
-	// 	}
-	// }
-
-	// slices.Reverse(previousMsgs)
-
 	channelList := make([]userChannelState, 0)
-
-	// for c, _ := range a.messages {
-	// 	channelList = append(channelList, userChannelState{
-	// 		channelId: c,
-	// 		unread: 0,
-	// 	})
-	// }
-
-	// Registration parts
-
 	usernameInput := textinput.New()
 	usernameInput.Placeholder = "your_username"
 	usernameInput.CharLimit = 10
@@ -889,7 +878,6 @@ func initialModel(a *app, width int, height int, sess ssh.Session) model {
 }
 
 func (m model) Init() tea.Cmd {
-	// return textarea.Blink
 	return m.viewChatModel.alert.Init()
 }
 var (
@@ -984,22 +972,14 @@ func updateChatLines(m *model) {
 		newMessage := ""
 		time := m.viewChatModel.dateStyle.Render(fmt.Sprintf(" %02d:%02d UTC ", v.time.Hour(), v.time.Minute()))
 		if(i==0 || m.viewChatModel.messages[i-1].sender!=v.sender){
-			if(v.sender=="islebot"){
+			if(v.sender==m.app.config.BotUsername){
 				newMessage+="\n"+botSenderStyle.Render(v.sender)+" "+botMsg+""+time+"\n"
-			// I promise I will unhardcode this later lol
-			}else if(v.sender=="ashfn"){
+			}else if(v.sender==m.app.config.AdminUsername){
 				newMessage+="\n"+m.viewChatModel.senderStyle.Render(v.sender)+" "+adminMsg+""+time+"\n"
 			}else{
 				newMessage+="\n"+m.viewChatModel.senderStyle.Render(v.sender)+time+"\n"
 			}
 		}
-		// // out, err := m.app.glamourRenderer.Render(v.text)
-		// if err != nil {
-		// 	newMessage+=v.text
-		// 	panic(err)
-		// }else{
-		// 	newMessage+=out
-		// }
 		newMessage+=simpleMarkdown(v.text)+"\n"
 		messageText+=newMessage
 	}
@@ -1051,14 +1031,10 @@ func addUserToChannel(app *app, user string, channel string) bool {
 }
 
 // Adds a user to a channel, adding them to the database and updating
-// all the state and user lists
 func removeUserFromChannel(app *app, user string, channel string) bool {
-	// err := gorm.G[User](app.db).Where("id = ?", user).Update(context.Background(), "name", "hello")
 
 	dbuser := User{ID: user}
 
-	// 2. Use the Association API to append the channel
-	// This automatically handles the 'user_channels' join table
 	err := app.db.Model(&dbuser).Association("Channels").Delete(&Channel{ID: channel})
 
 	if(err!=nil){
@@ -1075,17 +1051,7 @@ func removeUserFromChannel(app *app, user string, channel string) bool {
 		}
 	}
 	app.sessions[user].joinedChannels = newJoinedChannels
-	// app.sessions[user].currentChannelId = "global"
-	// app.sessions[user].joinedChannels = append(app.sessions[user].joinedChannels, channel)
-	// app.channelMembers[channel][user]=app.sessions[user]
 	app.mu.Unlock()
-	
-
-
-	// updateChannelMemberList(app, channel)
-
-	// Update the user's channel list
-
 
 	return true	
 }
@@ -1223,36 +1189,9 @@ func updateChannelMemberList(params updateChannelMemberListParameters){
 	}
 }
 
-// func userLeftx(m *model){
-
-// 	if(m.viewMode==viewChat){
-// 		// Also need to add update stuff but can do that later
-// 		log.Error("Left")
-// 		m.app.mu.Lock()
-// 		for _,v := range m.viewChatModel.channels{
-// 			delete(m.app.channelMembers[v.channelId], m.viewChatModel.id)
-// 		}
-// 		// m.viewChatModel.channels
-// 		delete(m.app.sessions, m.viewChatModel.id)
-// 		m.app.mu.Unlock()
-// 		for _,v := range m.viewChatModel.channels{
-// 			updateChannelMemberList(m.app, v.channelId)
-// 		}
-
-// 	}else{
-
-// 		m.app.mu.Lock()
-// 		delete(m.app.sessions, m.viewChatModel.id)
-// 		m.app.mu.Unlock()
-
-// 		// We dont need to handle updating user lists or anything as they aren't registered
-// 	}
-
-// }
-
 func sendIslebotMessage(m *model, msg string){
 	m.viewChatModel.messages = append(m.viewChatModel.messages, chatMsg{
-		sender: "islebot",
+		sender: m.app.config.BotUsername,
 		text: msg,
 		time: time.Now(),
 		channel: m.viewChatModel.channels[m.viewChatModel.currentChannel].channelId,
@@ -1263,7 +1202,7 @@ func sendIslebotMessage(m *model, msg string){
 func sendIslebotMessagePermanent(app *app, message string, channel string){
 
 	app.sendMessage(chatMsg{
-		sender: "islebot",
+		sender: app.config.BotUsername,
 		text: message,
 		time: time.Now(),
 		channel: channel,
@@ -1275,11 +1214,10 @@ func BannerWidth(s string) int {
     width := 0
     for _, r := range s {
         if r >= 0x2800 && r <= 0x28FF {
-            width++ // Braille patterns (1 column each)
+            width++
         } else if r < 128 {
-            width++ // ASCII
+            width++ 
         }
-        // Everything else is ignored/stripped
     }
     return width
 }
@@ -1332,8 +1270,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 				switch msg.Type {
 				case tea.KeyCtrlC, tea.KeyEsc:
-					// Need generic method for when a user left
-					// userLeft(&m)
 					return m, tea.Quit
 				case tea.KeyEnter:
 					if m.viewChatModel.textarea.Value() != "" {
@@ -1368,7 +1304,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
   /chan join <name>
   /chan leave
   /chan banner <text>
- For updates join #news`
+ For updates join #`+m.app.config.AnnouncementChannel
 
 										if(len(command)>1){
 											switch command[1]{
@@ -1408,8 +1344,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 																	// New channel was made
 																	m.app.mu.Lock()
-																	// m.app.channelMembers[newChannelName]=make(map[string]*userSession)
-																	// m.app.channelMembers[newChannelName][m.viewChatModel.id]=m.app.sessions[m.viewChatModel.id]
 																	m.app.messages[newChannelName]=make([]chatMsg, 0)
 																	m.app.channelMemberListCache[newChannelName]=&channelMemberList{
 																		onlineMembers: make(map[string]*userSession),
@@ -1453,8 +1387,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 														sendIslebotMessage(&m, "Usage: /chan create [name]")
 													}
 												case "join":
-													// For now we are forgetting about invites and they will only join
-													// the channel if it is public and they are not already in it
 
 													if(len(command)==3){
 														m.app.mu.RLock()
@@ -1468,8 +1400,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 																_, ok := m.app.channelMemberListCache[channelName].onlineMembers[userId]
 																m.app.mu.RUnlock()
 																if(!ok){
-																	// join
-																	// sendIslebotMessage(&m, fmt.Sprintf("%s wants to join #%s", userId, channelName))
 																	addUserToChannel(m.app, userId, channelName)
 																	updateChannelMemberList(updateChannelMemberListParameters{
 																		app: m.app,
@@ -1486,7 +1416,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 																	sendIslebotMessage(&m, fmt.Sprintf("You are already a member of #%s. You can leave it with /chan leave %s", channelName, channelName))
 																}
 															}else{
-																// Maybe in the future send a nice welcome message in the channel or something
 																_, err := gorm.G[Invite](m.db).
 																		Where("user_id = ?", m.viewChatModel.id).
 																		Where("channel_id = ?", channelName).
@@ -1534,7 +1463,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 														if(channel.OwnerID==m.viewChatModel.id){
 															if(!channel.Public){
 
-																// Check user is not in channel and user exists
 																m.app.mu.RLock()
 																_, onlineok := m.app.channelMemberListCache[channel.ID].onlineMembers[targetUser]
 																_, offlineok := m.app.channelMemberListCache[channel.ID].offlineMembers[targetUser]
@@ -1610,7 +1538,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 														if(channel.OwnerID==m.viewChatModel.id){
 															if(!channel.Public){
 																// Update all the meta info and the DB
-																// Delete all invites maybe?
 																_, err := gorm.G[Channel](m.app.db).Where("id = ?", channel.ID).
 																	Update(context.Background(), "public", true)
 																
@@ -1798,21 +1725,19 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
   /chan join <name>
   /chan leave
   /chan banner <text>
- For updates join #news`)
+ For updates join #`+m.app.config.AnnouncementChannel)
 									default:
 										m.viewChatModel.messages = append(m.viewChatModel.messages, chatMsg{
-											sender: "islebot",
+											sender: m.config.BotUsername,
 											text: "I dont know that command. Try /help",
 											time: time.Now(),
 											channel: m.viewChatModel.channels[m.viewChatModel.currentChannel].channelId,
 										})
 										updateChatLines(&m)
 								}
-								// if(strings.ToLower(comm))
-								// if(command[0])
 							}
 						}else{
-							if(m.viewChatModel.channels[m.viewChatModel.currentChannel].channelId == "news" && m.viewChatModel.id!="ashfn"){
+							if(m.viewChatModel.channels[m.viewChatModel.currentChannel].channelId == m.config.AnnouncementChannel && m.viewChatModel.id!=m.config.AdminUsername){
 								sendIslebotMessage(&m, "Sorry you can't post in this channel")
 							}else{
 								m.app.sendMessage(chatMsg{
@@ -1919,8 +1844,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				updateUserList(&m)
 
 			case tea.WindowSizeMsg:
-				// m.windowHeight = msg.Height
-				// m.windowWidth = msg.Width
 				m.viewChatModel.channelListViewport = getNewChannelListViewport(m.app, msg.Width, msg.Height, m.viewChatModel.focus)
 				m.viewChatModel.userListViewport = getNewUserListViewport(m.app, msg.Width, msg.Height, m.viewChatModel.focus)
 				m.viewChatModel.messageHistoryViewport = getNewMessageHistoryViewport(m.app, msg.Width, msg.Height, m.viewChatModel.focus)
@@ -1930,9 +1853,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				updateUserList(&m)
 			
 			case chatMsg:
-				// m.app.mu.RLock()
-				// m.viewChatModel.messages = m.app.messages[m.viewChatModel.channels[m.viewChatModel.currentChannel].channelId]
-				// m.app.mu.RUnlock()
 				if(msg.channel==m.viewChatModel.channels[m.viewChatModel.currentChannel].channelId){
 					m.viewChatModel.messages = append(m.viewChatModel.messages, msg)
 				}else{
@@ -1948,26 +1868,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.viewChatModel.channels = msg.channels
 				if(msg.firstjoin){
 					sendIslebotMessagePermanent(m.app, fmt.Sprintf("A new user joined for the first time! Welcome @%s. Run /help for information", m.viewChatModel.id), "global")
-					// sendIslebotMessage(&m, "Welcome to isle.chat! You are in the #global channel but you can create and join your own channels using /chan. For all commands run /help, for news and updates /chan join news. Enjoy your stay!")
-					// m.viewChatModel.messages = append(m.viewChatModel.messages, chatMsg{
-					// 	sender:  "islebot",
-					// 	text:    ,
-					// 	time:    time.Now(),
-					// 	channel: "global",
-					// })
-					// updateChatLines(&m)	
+
 				}
 				updateChannelList(&m)
 			
 			case channelMemberListMsg:
 				m.viewChatModel.memberList=msg
 				updateUserList(&m)
-			
-			case tea.QuitMsg:
-				// userLeft(&m)
-				// User left
-				// delete(m.app.progs, m.viewChatModel.id)
-				// m.app.updateUserlists()
+		
 
 			case errMsg:
 				m.viewChatModel.err = msg
@@ -1987,10 +1895,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 			case tea.KeyMsg:
 				if(msg.Type == tea.KeyCtrlC || msg.Type==tea.KeyEsc){
-					// User left
-					// delete(m.app.progs, m.viewChatModel.id)
-					// m.app.updateUserlists()
-					// userLeft(&m)
 					return m, tea.Quit
 				}
 				if(msg.Type == tea.KeyEnter || msg.Type == tea.KeyTab || msg.Type == tea.KeyDown){
@@ -2011,7 +1915,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 								return m,nil
 							}
 
-							if(newUsername=="islebot"){
+							if(newUsername==m.app.config.BotUsername){
 								m.viewRegistrationModel.feedbackViewport.SetContent("You cannot have this username")
 								return m,nil	
 							}
@@ -2035,7 +1939,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 							})
 
 							if(err!=nil){
-								// m.viewRegistrationModel.feedbackViewport.SetContent("Error creating account (2)")
 								m.viewRegistrationModel.feedbackViewport.SetContent("Username already exists")
 								return m,nil
 							}else{
@@ -2068,13 +1971,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 												})
 									},
 								)
-								// updateChannelMemberList(m.app, "global")
 								// Account was created
 							}
-
-							// m.viewRegistrationModel.feedbackViewport.SetContent("test")
-							// return (m, )
-							// Sign up!
 						}
 					}
 				}
@@ -2090,13 +1988,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					// Cant go higher than username box
 				}
 				updateRegistrationTextFocuses(&m)
-			case tea.QuitMsg:
-				// delete(m.app.progs, m.viewChatModel.id)
-				// m.app.updateUserlists()
-				// userLeft(&m)
 			case tea.WindowSizeMsg:
-				// m.windowHeight = msg.Height
-				// m.windowWidth = msg.Width
 				m.viewChatModel.channelListViewport = getNewChannelListViewport(m.app, msg.Width, msg.Height, m.viewChatModel.focus)
 				m.viewChatModel.userListViewport = getNewUserListViewport(m.app, msg.Width, msg.Height, m.viewChatModel.focus)
 				m.viewChatModel.messageHistoryViewport = getNewMessageHistoryViewport(m.app, msg.Width, msg.Height, m.viewChatModel.focus)
@@ -2117,32 +2009,22 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
     return m, tea.Batch(tiCmd, mvpCmd, uvpCmd, outCmd, alertCmd)
 }
 
-// yes, this is indeed ai slop
-// gemini 3 if your interested
 func FormatBanner(input string) string {
 	const width = 20
 	const height = 10
 
-	// 1. Normalize line endings. 
-	// We do NOT trim leading/trailing whitespace because TUI art relies on it.
 	input = strings.ReplaceAll(input, "\r\n", "\n")
 	originalLines := strings.Split(input, "\n")
 
 	var finalRows []string
 
-	// 2. Process each line for wrapping
 	for _, line := range originalLines {
 		runes := []rune(line)
-
-		// Handle explicit empty lines
 		if len(runes) == 0 {
 			finalRows = append(finalRows, "")
 			continue
 		}
-
-		// 3. Wrap Logic: Keep chunking until the line is exhausted
 		for len(runes) > 0 {
-			// Stop if we've filled the 10-row vertical limit
 			if len(finalRows) >= height {
 				break
 			}
@@ -2151,8 +2033,6 @@ func FormatBanner(input string) string {
 			if len(runes) < width {
 				chunkSize = len(runes)
 			}
-
-			// Clean control characters (tabs, etc) to prevent terminal misalignment
 			chunk := make([]rune, chunkSize)
 			for i := 0; i < chunkSize; i++ {
 				if unicode.IsControl(runes[i]) {
@@ -2166,8 +2046,6 @@ func FormatBanner(input string) string {
 			runes = runes[chunkSize:]
 		}
 	}
-
-	// 4. Final Grid Construction
 	var sb strings.Builder
 	for i := 0; i < height; i++ {
 		var content string
@@ -2177,18 +2055,11 @@ func FormatBanner(input string) string {
 			content = finalRows[i]
 			contentWidth = len([]rune(content))
 		}
-
-		// Write the content we have for this row
 		sb.WriteString(content)
-
-		// 5. Fill to exactly 20 spaces
-		// This ensures the "new space" is always filled to the edge
 		padding := width - contentWidth
 		if padding > 0 {
 			sb.WriteString(strings.Repeat(" ", padding))
 		}
-
-		// Add newline for all but the last row to maintain TUI block shape
 		if i < height-1 {
 			sb.WriteRune('\n')
 		}
@@ -2306,11 +2177,6 @@ func (m model) View() string {
 			);
 
 			channelList := func() string {
-					// if m.focus==FocusedBoxChannelList {
-					// 	return FocusedStyle.Render(m.channelListViewport.View())
-					// } else {
-					// 	return UnfocusedStyle.Render(m.channelListViewport.View())
-					// }
 				return UnfocusedStyle.Render(m.viewChatModel.channelListViewport.View())
 			}()
 
@@ -2342,7 +2208,7 @@ func (m model) View() string {
 
 			titleRegBox := RegistrationBox()
 			return m.viewChatModel.alert.Render(lipgloss.JoinVertical(lipgloss.Right, 
-				"isle.chat registration   ",
+				m.app.config.RegistrationHeader,
 				titleRegBox.Render("username", usernameBox, 26, m.viewRegistrationModel.FocusedBox==RegistrationUsernameFocused),
 				titleRegBox.Render("password", passwordBox, 26, m.viewRegistrationModel.FocusedBox==RegistrationPasswordFocused),
 				titleRegBox.Render("confirm", passwordConfirmBox, 26, m.viewRegistrationModel.FocusedBox==RegistrationPasswordConfirmFocused),

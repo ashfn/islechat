@@ -2,7 +2,8 @@
 go.sum
 islechat
 run.sh
-test.db
+islechat.db
 theme.json
 todo.txt
 .ssh
+newtodo.txt

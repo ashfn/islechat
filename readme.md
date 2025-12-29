@@ -32,6 +32,7 @@ docker run -t -i -p 2222:2222 -e CLICOLOR_FORCE=1 -e COLORTERM=truecolor -e TERM
 ```
 
 Additonally a docker-compose file is in this repository. The format of the config.toml file is:
+
 ```bash
 Host = "0.0.0.0"
 Port = "2222"
@@ -54,9 +55,9 @@ PostgresSSL = "disable"
 ```
 
 ### SSH key
-SSH key is used from the path: `.ssh/id_ed25519"` (They will be auto created if you dont specify one)
+SSH key is used from the path: `.ssh/id_ed25519"` (They will be auto created if you dont specify one).
 
-### Why use this?
+###  Why use this?
 - Communicate with friends in separated channels
 - Connect from anywhere with your credentials (ssh is installed everywhere)
 

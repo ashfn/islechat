@@ -1,6 +1,0 @@
-[x] Fix double messages without ruining bot messages
-[] Fix logs to console
-[] Show keybinds at the bottom
-[] Proper input sanitization everywhere
-[] Add auto moderation stuff for usernames/messages/channels
-[] Proper configuration for sqlite/postgres and more

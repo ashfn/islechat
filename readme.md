@@ -16,12 +16,13 @@ For now the code is all in one file, `main.go`, but I'm planning on cleaning it 
 Built using the charm bubbletea/wish stack
 
 ## Features
-- Users can create their own channels and make them public or private. They can invite users and change the banner (20x10 character) of their channel which shows on the right.
-- Messages and accounts are persistent and stored on the database. SSH in from anywhere with your credentials and catch up with what you've missed
-- Who's online? A member list on the right shows online users and in private channels also shows offline users
-- Discord/slack style interface with channels on the left, chat in the middle and users on the right
-- Channels with new messages show on the channel list on the left with the number of unread messages
-
+* Users can create their own channels and make them public or private. They can invite users and change the banner (20x10 character) of their channel which shows on the right.
+* Messages and accounts are persistent and stored on the database. SSH in from anywhere with your credentials and catch up with what you've missed
+* Who's online? A member list on the right shows online users and in private channels also shows offline users
+* Discord/slack style interface with channels on the left, chat in the middle and users on the right
+* Channels with new messages show on the channel list on the left with the number of unread messages
+  
+## For news and help join the discord server: https://discord.gg/q35CTJvngp
 
 ## Self-hosting
 
@@ -61,7 +62,7 @@ SSH key is used from the path: `.ssh/id_ed25519"` (They will be auto created if 
 - Communicate with friends in separated channels
 - Connect from anywhere with your credentials (ssh is installed everywhere)
 
-### Commands:
+### Commands:
  - /chan create <name>
  - /chan public
  - /chan private

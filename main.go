@@ -176,7 +176,6 @@ func (a *app) sendMessage(msg chatMsg) {
 
 		for _, p := range a.channelMemberListCache[msg.channel].onlineMembers {
 			if(p.loggedIn){
-				log.Info("MSG-SENT")
 				go p.prog.Send(msg)
 			}
 		}
@@ -612,6 +611,7 @@ type viewChatModel struct {
 	windowHeight int
 	windowWidth int
 	alert   bubbleup.AlertModel
+	sidebarsEnabled bool
 }
 
 type model struct {
@@ -651,6 +651,9 @@ func getNewUserListViewport(a *app, width int, height int, focus FocusedBox) vie
 
 func getNewMessageHistoryViewport(a *app, width int, height int, focus FocusedBox) viewport.Model {
 	mvp := viewport.New(max(0,width-48), max(0,height-7))
+	if(width<71){
+		mvp = viewport.New(max(0,width-3), max(0,height-7))
+	}
 	if(focus==FocusedBoxChatHistory){
 		VPEnableScrolling(&mvp)
 	}else{
@@ -809,6 +812,7 @@ func initialModel(a *app, width int, height int, sess ssh.Session) model {
 				memberList: a.channelMemberListCache["global"],
 				focus: FocusedBoxChatInput,	
 				alert: *bubbleup.NewAlertModel(40, false, 2),
+				sidebarsEnabled: true,
 			},
 			viewRegistrationModel: viewRegistrationModel{
 				usernameInput: usernameInput,
@@ -853,6 +857,7 @@ func initialModel(a *app, width int, height int, sess ssh.Session) model {
 				memberList: a.channelMemberListCache["global"],
 				focus: FocusedBoxChatInput,
 				alert: *bubbleup.NewAlertModel(40, false, 2),
+				sidebarsEnabled: true,
 
 			},
 			viewRegistrationModel: viewRegistrationModel{
@@ -1644,7 +1649,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 													m.app.mu.RLock()
 													channel := m.app.channels[m.viewChatModel.channels[m.viewChatModel.currentChannel].channelId]
 													m.app.mu.RUnlock()
-													if(channel.OwnerID==m.viewChatModel.id){
+													log.Infof("%s:%s",m.viewChatModel.id,m.app.config.AdminUsername)
+													if(channel.OwnerID==m.viewChatModel.id || (channel.ID=="global" && m.viewChatModel.id == m.app.config.AdminUsername)){
 														if(len(m.viewChatModel.textarea.Value())>12){
 															banner := m.viewChatModel.textarea.Value()[13:]
 															blen := BannerWidth(banner)
@@ -1882,7 +1888,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.viewChatModel.channelListViewport = getNewChannelListViewport(m.app, msg.Width, msg.Height, m.viewChatModel.focus)
 				m.viewChatModel.userListViewport = getNewUserListViewport(m.app, msg.Width, msg.Height, m.viewChatModel.focus)
 				m.viewChatModel.messageHistoryViewport = getNewMessageHistoryViewport(m.app, msg.Width, msg.Height, m.viewChatModel.focus)
-				m.viewChatModel.textarea.SetWidth(max(0,msg.Width-47))
+				if(msg.Width<71){
+					m.viewChatModel.sidebarsEnabled = false
+					m.viewChatModel.textarea.SetWidth(max(0,msg.Width-2))
+				}else{
+					m.viewChatModel.sidebarsEnabled = true
+					m.viewChatModel.textarea.SetWidth(max(0,msg.Width-47))
+				}
 				updateChannelList(&m)
 				updateChatLines(&m)
 				updateUserList(&m)
@@ -2208,15 +2220,19 @@ func (m model) View() string {
 		BorderForeground(lipgloss.Color("240"))
 	switch(m.viewMode){
 		case viewChat:
+			titleRegBox := RegistrationBox()
+
+			channel := "..."
+			if(m.viewChatModel.currentChannel<len(m.viewChatModel.channels)){
+				channel = m.viewChatModel.channels[m.viewChatModel.currentChannel].channelId
+			}
 			chatSection := fmt.Sprintf(
 				"%s\n%s",
-				func() string {
-					if m.viewChatModel.focus==FocusedBoxChatHistory {
-						return FocusedStyle.PaddingLeft(1).Render(m.viewChatModel.messageHistoryViewport.View())
-					} else {
-						return UnfocusedStyle.PaddingLeft(1).Render(m.viewChatModel.messageHistoryViewport.View())
-					}
-				}(),
+				titleRegBox.Render(
+					fmt.Sprintf("#%s (@%s)", channel, m.viewChatModel.id),
+					m.viewChatModel.messageHistoryViewport.View(),
+					m.viewChatModel.messageHistoryViewport.Width+1,
+					m.viewChatModel.focus==FocusedBoxChatHistory) ,
 				func() string {
 					if m.viewChatModel.focus==FocusedBoxChatInput {
 						return FocusedStyle.Render(m.viewChatModel.textarea.View())
@@ -2227,16 +2243,24 @@ func (m model) View() string {
 			);
 
 			channelList := func() string {
-				return UnfocusedStyle.Render(m.viewChatModel.channelListViewport.View())
+				if(m.viewChatModel.sidebarsEnabled){
+					return UnfocusedStyle.Render(m.viewChatModel.channelListViewport.View())
+				}else{
+					return ""
+				}
 			}()
 
 			userList := func() string {
+				if(m.viewChatModel.sidebarsEnabled){
 					if m.viewChatModel.focus==FocusedBoxUserList {
 						return FocusedStyle.Render(getFullUserListBar(m))
 					} else {
 						return UnfocusedStyle.Render(getFullUserListBar(m))
 					}
-				}();
+				}else{
+					return ""
+				}
+			}();
 			
 			return m.viewChatModel.alert.Render(
 				lipgloss.JoinHorizontal(lipgloss.Bottom, channelList, chatSection, userList))

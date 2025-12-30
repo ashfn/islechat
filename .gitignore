@@ -4,3 +4,4 @@ islechat.db
 
 # Nix
 /.direnv
+stresstest/

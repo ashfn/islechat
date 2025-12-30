@@ -743,8 +743,11 @@ func initialModel(a *app, width int, height int, sess ssh.Session) model {
 	cvp := getNewChannelListViewport(a, width, height, FocusedBoxChatInput)
 
 	ta.KeyMap.InsertNewline.SetEnabled(false)
-
+	a.mu.RLock()
 	previousMsgs := a.messages["global"]
+	msgsCopy := make([]chatMsg, len(previousMsgs))
+	copy(msgsCopy, previousMsgs)	
+	a.mu.RUnlock()
 	channelList := make([]userChannelState, 0)
 	usernameInput := textinput.New()
 	usernameInput.Placeholder = "your_username"
@@ -785,7 +788,7 @@ func initialModel(a *app, width int, height int, sess ssh.Session) model {
 			viewChatModel: viewChatModel{
 				id: sess.User(),
 				textarea:    ta,
-				messages:    previousMsgs,
+				messages:    msgsCopy,
 				messageHistoryViewport:    mvp,
 				userListViewport: uvp,
 				channelListViewport: cvp,
@@ -829,7 +832,7 @@ func initialModel(a *app, width int, height int, sess ssh.Session) model {
 			viewChatModel: viewChatModel{
 				id: sess.Context().SessionID(),
 				textarea:    ta,
-				messages:    previousMsgs,
+				messages:    msgsCopy,
 				messageHistoryViewport:    mvp,
 				userListViewport: uvp,
 				channelListViewport: cvp,

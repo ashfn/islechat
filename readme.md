@@ -17,9 +17,10 @@ Built using the charm bubbletea/wish stack
 
 ## Features
 - Users can create their own channels and make them public or private. They can invite users and change the banner (20x10 character) of their channel which shows on the right.
+- Messages and accounts are persistent and stored on the database. SSH in from anywhere with your credentials and catch up with what you've missed
 - Who's online? A member list on the right shows online users and in private channels also shows offline users
 - Discord/slack style interface with channels on the left, chat in the middle and users on the right
-- Channels with new messages show on the channel list on the right with the number of unread messages
+- Channels with new messages show on the channel list on the left with the number of unread messages
 
 
 ## Self-hosting

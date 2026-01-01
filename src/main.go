@@ -1135,6 +1135,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.viewChatModel.err = msg
 				return m, nil
 			}
+
 			// Put it down here so we can do the other stuff first
 			m.viewChatModel.textarea, tiCmd = m.viewChatModel.textarea.Update(msg)
 
@@ -1256,7 +1257,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.viewChatModel.channelListViewport = getNewChannelListViewport(m.app, msg.Width, msg.Height, m.viewChatModel.focus)
 				m.viewChatModel.userListViewport = getNewUserListViewport(m.app, msg.Width, msg.Height, m.viewChatModel.focus)
 				m.viewChatModel.messageHistoryViewport = getNewMessageHistoryViewport(m.app, msg.Width, msg.Height, m.viewChatModel.focus)
-				m.viewChatModel.textarea.SetWidth(max(0,msg.Width-47))
+				if(msg.Width<71){
+					m.viewChatModel.sidebarsEnabled = false
+					m.viewChatModel.textarea.SetWidth(max(0,msg.Width-2))
+				}else{
+					m.viewChatModel.sidebarsEnabled = true
+					m.viewChatModel.textarea.SetWidth(max(0,msg.Width-47))
+				}
 				updateChannelList(&m)
 				updateChatLines(&m)
 				updateUserList(&m)

@@ -22,7 +22,7 @@ func (te *timezoneEstimator) setupGeoipDatabase(){
 
 	if(err!=nil){
 		te.available = false
-		fmt.Print("Couldn't setup geolite database")
+		fmt.Println("Couldn't setup geolite database")
 		return 
 	}
 

@@ -6,7 +6,7 @@ import (
 	humanize "github.com/dustin/go-humanize"
 	"github.com/charmbracelet/lipgloss"
 	"fmt"
-	// "time"
+	"time"
 	"regexp"
 	"slices"
 	"maps"
@@ -107,14 +107,24 @@ func updateChatLines(m *model) {
 		newMessage := ""
 		// timestamp := m.viewChatModel.dateStyle.Render(fmt.Sprintf(" %02d:%02d UTC ", v.time.Hour(), v.time.Minute()))
 		timestamp := v.time.In(m.viewChatModel.timezone)
-		time := m.viewChatModel.dateStyle.Render(fmt.Sprintf(" %02d:%02d ", timestamp.Hour(), timestamp.Minute()))
-		if(i==0 || m.viewChatModel.messages[i-1].sender!=v.sender){
+		timeRendered := m.viewChatModel.dateStyle.Render(fmt.Sprintf(" %02d:%02d ", timestamp.Hour(), timestamp.Minute()))
+
+		// If it was betwen 24 and 48h ago 'yesterday at x'
+		if(time.Now().UnixMilli()-timestamp.UnixMilli() > 24*3600*1000){
+			timeRendered = m.viewChatModel.dateStyle.Render(fmt.Sprintf(" Yesterday at %02d:%02d ", timestamp.Hour(), timestamp.Minute()))
+		}
+
+		if(time.Now().UnixMilli()-timestamp.UnixMilli() > 48*3600*1000){
+			timeRendered = m.viewChatModel.dateStyle.Render(fmt.Sprintf(" %02d/%02d/%02d, %02d:%02d ", timestamp.Day(), timestamp.Month(), timestamp.Year(), timestamp.Hour(), timestamp.Minute()))
+		}
+
+		if(i==0 || m.viewChatModel.messages[i-1].sender!=v.sender || m.viewChatModel.messages[i].time.UnixMilli()-m.viewChatModel.messages[i-1].time.UnixMilli()>300000){
 			if(v.sender==m.app.config.BotUsername){
-				newMessage+="\n"+botSenderStyle.Render(v.sender)+" "+botMsg+""+time+"\n"
+				newMessage+="\n"+botSenderStyle.Render(v.sender)+" "+botMsg+""+timeRendered+"\n"
 			}else if(v.sender==m.app.config.AdminUsername){
-				newMessage+="\n"+m.viewChatModel.senderStyle.Render(v.sender)+" "+adminMsg+""+time+"\n"
+				newMessage+="\n"+m.viewChatModel.senderStyle.Render(v.sender)+" "+adminMsg+""+timeRendered+"\n"
 			}else{
-				newMessage+="\n"+m.viewChatModel.senderStyle.Render(v.sender)+time+"\n"
+				newMessage+="\n"+m.viewChatModel.senderStyle.Render(v.sender)+timeRendered+"\n"
 			}
 		}
 		newMessage+=simpleMarkdown(v.text)+"\n"

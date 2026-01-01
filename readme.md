@@ -21,6 +21,7 @@ Built using the charm bubbletea/wish stack
 * Who's online? A member list on the right shows online users and in private channels also shows offline users
 * Discord/slack style interface with channels on the left, chat in the middle and users on the right
 * Channels with new messages show on the channel list on the left with the number of unread messages
+* Set your timezone to see correct dates on messages (Persists across sessions). Timezones are initially set based on your ip
   
 ## For news and help join the discord server: https://discord.gg/q35CTJvngp
 
@@ -58,6 +59,8 @@ PostgresSSL = "disable"
 ### SSH key
 SSH key is used from the path: `.ssh/id_ed25519"` (They will be auto created if you dont specify one).
 
+If you want ip based timezone detection to work you need to download GeoLite2-City.mmdb from the website (You just have to make an account its free) and update it every now and then
+
 ###  Why use this?
 - Communicate with friends in separated channels
 - Connect from anywhere with your credentials (ssh is installed everywhere)
@@ -71,9 +74,8 @@ SSH key is used from the path: `.ssh/id_ed25519"` (They will be auto created if 
  - /chan join <name>
  - /chan leave
  - /chan banner <text>
-
+ - /tz <timezone>
 ### Features I'm working on adding:
-- Timezone support (Potential auto timezone detection using an ip geolocation db?) for message timestamps
 - Support for adding your pubkey for authentication alongside user/pass
 - Better channel ownership and moderation tools, for example having moderators and a simple permissions system
 

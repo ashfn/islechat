@@ -9,6 +9,7 @@ import (
 	"regexp"
 )
 
+
 func handleCmd(m *model, command []string){
 
 	if(len(command)>0){
@@ -514,6 +515,7 @@ For updates join #`+m.app.config.AnnouncementChannel)
 						}else{
 							m.viewChatModel.timezone = tz
 							updateChatLines(m)
+							sendIslebotMessage(m, fmt.Sprintf("Your timezone was set to %s", tz.String()))
 						}
 					}
 				}else{

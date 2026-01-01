@@ -18,5 +18,5 @@ services:
     tmpfs:
       - /tmp
     volumes:
-          - ./ssh_keys/id_ed25519:/home/islechat/app/.ssh/id_ed25519:ro   # <-- ADD THIS LINE
+          - ./ssh_keys/id_ed25519:/home/islechat/app/.ssh/id_ed25519:ro
           - ./config.toml:/home/islechat/config.toml

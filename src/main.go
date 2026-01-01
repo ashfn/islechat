@@ -498,6 +498,9 @@ func centerString(str string, width int) string {
 	return strings.Repeat(" ", spaces) + str + strings.Repeat(" ", width-(spaces+len(str)))
 }
 
+func beep() tea.Cmd {
+	return tea.Printf("\a")
+}
 
 
 // For only when a user joins the main area (From logging in or just signing up)
@@ -926,12 +929,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			mvpCmd tea.Cmd
 			uvpCmd tea.Cmd
 			alertCmd tea.Cmd
+			beepCmd tea.Cmd
 		)
+	
 	switch m.viewMode {
 
 		case viewChat:
 			switch msg := msg.(type) {
-
 			case tea.KeyMsg:
 				// Update viewports for keyboard input
 				m.viewChatModel.messageHistoryViewport, mvpCmd = m.viewChatModel.messageHistoryViewport.Update(msg)
@@ -1075,6 +1079,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			case chatMsg:
 				if(msg.channel==m.viewChatModel.channels[m.viewChatModel.currentChannel].channelId){
 					m.viewChatModel.messages = append(m.viewChatModel.messages, msg)
+					if(strings.Contains(msg.text, "@"+m.viewChatModel.id)){
+						beepCmd = beep()
+					}
 				}else{
 					for i,v := range m.viewChatModel.channels{
 						if(v.channelId==msg.channel){
@@ -1277,5 +1284,5 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	outAlert, outCmd := m.viewChatModel.alert.Update(msg)
 	m.viewChatModel.alert = outAlert.(bubbleup.AlertModel)
 
-    return m, tea.Batch(tiCmd, mvpCmd, uvpCmd, outCmd, alertCmd)
+    return m, tea.Batch(tiCmd, mvpCmd, uvpCmd, outCmd, alertCmd, beepCmd)
 }

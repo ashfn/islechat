@@ -127,7 +127,9 @@ func updateChatLines(m *model) {
 				newMessage+="\n"+m.viewChatModel.senderStyle.Render(v.sender)+timeRendered+"\n"
 			}
 		}
-		newMessage+=simpleMarkdown(v.text)+"\n"
+		mentionStyle := lipgloss.NewStyle().Background(lipgloss.Color("63")).Foreground(lipgloss.Color("255"))
+		addedMentions := strings.ReplaceAll(v.text, "@"+m.viewChatModel.id, mentionStyle.Render("@"+m.viewChatModel.id))
+		newMessage+=simpleMarkdown(addedMentions)+"\n"
 		messageText+=newMessage
 	}
 

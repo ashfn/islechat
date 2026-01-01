@@ -20,6 +20,7 @@ type User struct {
 	ID       string    `gorm:"primaryKey"`
 	Password string
 	Channels []Channel `gorm:"many2many:user_channels;"`
+	Timezone string `gorm:"default:UTC"`
 }
 
 type Message struct {
@@ -100,6 +101,8 @@ type app struct {
 	// If the user isn't logged in the username will be nil
 	sessionUsernames map[string]string
 
+	timezoneEstimator timezoneEstimator
+
 }
 
 // Session types
@@ -108,6 +111,7 @@ type userSession struct {
 	loggedIn         bool
 	username         string
 	currentChannelId string
+	inferredTimezone *time.Location
 	joinedChannels   []string
 }
 
@@ -184,6 +188,8 @@ type viewChatModel struct {
 	windowHeight           int
 	windowWidth            int
 	alert                  bubbleup.AlertModel
+	timezone *time.Location
+	sidebarsEnabled bool
 }
 
 type model struct {

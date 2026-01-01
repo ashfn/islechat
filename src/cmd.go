@@ -496,6 +496,30 @@ For updates join #`+m.app.config.AnnouncementChannel
 /chan leave
 /chan banner <text>
 For updates join #`+m.app.config.AnnouncementChannel)
+			case "tz", "timezone":
+				if(len(command)>1){
+					newtz := command[1]
+
+					tz, err := time.LoadLocation(newtz)
+
+
+					if(err!=nil){
+						sendIslebotMessage(m, fmt.Sprintf("Couldn't use that timezone. Use IANA timezones e.g. America/New_York you can find yours here: https://webbrowsertools.com/timezone/"))
+					}else{
+						_, err := gorm.G[User](m.app.db).Where("id = ?", m.viewChatModel.id).
+							Update(context.Background(), "timezone", tz.String())
+						
+						if(err!=nil){
+							sendIslebotMessage(m, fmt.Sprintf("Sorry an error occured updating your timezone. Please try again and if the error returns contact the administrator"))
+						}else{
+							m.viewChatModel.timezone = tz
+							updateChatLines(m)
+						}
+					}
+				}else{
+					// Just tell them their timezone
+					sendIslebotMessage(m, fmt.Sprintf("Your current timezone is set to %s, you can change it with /tz <timezone>", m.viewChatModel.timezone.String()))
+				}
 			default:
 				m.viewChatModel.messages = append(m.viewChatModel.messages, chatMsg{
 					sender: m.config.BotUsername,

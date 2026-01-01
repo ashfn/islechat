@@ -12,14 +12,28 @@ import (
 
 type timezoneEstimator struct {
 	reader *geoip2.Reader
+	available bool
 
 }
 
-func estimateTimezone(s ssh.Session) *time.Location {
+
+func (te *timezoneEstimator) setupGeoipDatabase(){
 	db, err := geoip2.Open("GeoLite2-City.mmdb")
 
 	if(err!=nil){
-		log.Fatal(err)
+		te.available = false
+		fmt.Print("Couldn't setup geolite database")
+		return 
+	}
+
+	te.available = true
+	te.reader = db
+}
+
+func (te *timezoneEstimator) estimateTimezone(s ssh.Session) *time.Location {
+
+	if(!te.available){
+		return time.UTC
 	}
 
 	stringip, _, err := net.SplitHostPort(s.Context().RemoteAddr().String())
@@ -34,7 +48,7 @@ func estimateTimezone(s ssh.Session) *time.Location {
 		log.Fatal(err)
 	}
 
-	record, err := db.City(ip)
+	record, err := te.reader.City(ip)
 	if err != nil {
 		log.Fatal(err)
 	}

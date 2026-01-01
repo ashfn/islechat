@@ -6,7 +6,131 @@ import (
 	humanize "github.com/dustin/go-humanize"
 	"github.com/charmbracelet/lipgloss"
 	"fmt"
+	// "time"
+	"regexp"
+	"slices"
+	"maps"
 )
+
+var (
+    boldRegex   = regexp.MustCompile(`\*\*(.+?)\*\*`)
+    italicRegex = regexp.MustCompile(`\*(.+?)\*`)
+    codeRegex   = regexp.MustCompile("`([^`]+)`")
+)
+
+func simpleMarkdown(text string) string {
+    text = boldRegex.ReplaceAllString(text, "\033[1m$1\033[0m")
+    text = italicRegex.ReplaceAllString(text, "\033[3m$1\033[0m")
+    text = codeRegex.ReplaceAllString(text, "\033[7m$1\033[0m")
+    return text
+}
+
+
+func updateUserList(m *model){
+	var content strings.Builder
+
+    onlineStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("10"))
+	offlineStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("240"))
+
+	sortedOnline := slices.Sorted(maps.Keys(m.viewChatModel.memberList.onlineMembers))
+	sortedOffline := slices.Sorted(maps.Keys(m.viewChatModel.memberList.offlineMembers))
+
+    for _, v := range sortedOnline {
+        line := fmt.Sprintf("@%s", m.viewChatModel.memberList.onlineMembers[v].username)
+        content.WriteString(onlineStyle.Render(line) + "\n")
+    }
+
+    for _, v := range sortedOffline {
+        line := fmt.Sprintf("@%s", v)
+        content.WriteString(offlineStyle.Render(line) + "\n")
+    }
+
+    m.viewChatModel.userListViewport.SetContent(content.String())
+}
+
+
+func updateChannelList(m *model){
+
+	focused := m.viewChatModel.focus == FocusedBoxChannelList
+
+	channelListText := ""
+
+	currentChannel := lipgloss.NewStyle().Background(lipgloss.Color("240")).Foreground(lipgloss.Color("15"))
+	currentChannelFocused := lipgloss.NewStyle().Background(lipgloss.Color("84")).Foreground(lipgloss.Color("240"))
+	otherChannel := lipgloss.NewStyle().Foreground(lipgloss.Color("243"))
+	otherChannelUnread := lipgloss.NewStyle().Foreground(lipgloss.Color("15"))
+	notificationCount := lipgloss.NewStyle().Foreground(lipgloss.Color("87"))
+	for _, v := range m.viewChatModel.channels {
+		if(m.viewChatModel.channels[m.viewChatModel.currentChannel]==v){
+			if(focused){
+				channelListText+=currentChannelFocused.Render(fmt.Sprintf("# %-18s", v.channelId))+"\n"
+			}else{
+				channelListText+=currentChannel.Render(fmt.Sprintf("# %-18s", v.channelId))+"\n"
+			}
+		}else{
+			if(v.unread>0){
+				if(v.unread>9){
+					channelListText+=otherChannelUnread.Render(fmt.Sprintf("# %-13s  ", v.channelId))+
+					notificationCount.Render("9+ ")+"\n"
+				}else{
+					channelListText+=otherChannelUnread.Render(fmt.Sprintf("# %-13s   ", v.channelId))+
+					notificationCount.Render(fmt.Sprintf("%d  ", v.unread))+"\n"
+				}
+			}else{
+				channelListText+=otherChannel.Render(fmt.Sprintf("# %-18s", v.channelId))+"\n"
+			}
+		}
+	}
+
+	if(m.viewChatModel.currentChannel<len(m.viewChatModel.channels)){
+		channel, ok := m.app.channels[m.viewChatModel.channels[m.viewChatModel.currentChannel].channelId]
+		if(ok){
+			m.viewChatModel.channelBanner = channel.Banner
+		}
+	}
+
+
+	m.viewChatModel.channelListViewport.SetContent(channelListText)
+}
+
+func updateChatLines(m *model) {
+	messageText := ""
+
+
+	botMsg := lipgloss.NewStyle().Background(lipgloss.Color("63")).Foreground(lipgloss.Color("15")).Render(" BOT ")
+	adminMsg := lipgloss.NewStyle().Foreground(lipgloss.Color("78")).Render("(admin)")
+
+	botSenderStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("121"))
+
+
+	for i, v := range m.viewChatModel.messages {
+		newMessage := ""
+		// timestamp := m.viewChatModel.dateStyle.Render(fmt.Sprintf(" %02d:%02d UTC ", v.time.Hour(), v.time.Minute()))
+		timestamp := v.time.In(m.viewChatModel.timezone)
+		time := m.viewChatModel.dateStyle.Render(fmt.Sprintf(" %02d:%02d ", timestamp.Hour(), timestamp.Minute()))
+		if(i==0 || m.viewChatModel.messages[i-1].sender!=v.sender){
+			if(v.sender==m.app.config.BotUsername){
+				newMessage+="\n"+botSenderStyle.Render(v.sender)+" "+botMsg+""+time+"\n"
+			}else if(v.sender==m.app.config.AdminUsername){
+				newMessage+="\n"+m.viewChatModel.senderStyle.Render(v.sender)+" "+adminMsg+""+time+"\n"
+			}else{
+				newMessage+="\n"+m.viewChatModel.senderStyle.Render(v.sender)+time+"\n"
+			}
+		}
+		newMessage+=simpleMarkdown(v.text)+"\n"
+		messageText+=newMessage
+	}
+
+	content := lipgloss.NewStyle().
+		Width(m.viewChatModel.messageHistoryViewport.Width).
+		Render(messageText)
+
+	m.viewChatModel.messageHistoryViewport.SetContent(content)
+	if(m.viewChatModel.focus!=FocusedBoxChatHistory){
+		m.viewChatModel.messageHistoryViewport.GotoBottom()
+	}
+}
+
 
 func FormatBanner(input string) string {
 	const width = 20
@@ -151,15 +275,19 @@ func (m model) View() string {
 		BorderForeground(lipgloss.Color("240"))
 	switch(m.viewMode){
 		case viewChat:
+			titleRegBox := RegistrationBox()
+
+			channel := "..."
+			if(m.viewChatModel.currentChannel<len(m.viewChatModel.channels)){
+				channel = m.viewChatModel.channels[m.viewChatModel.currentChannel].channelId
+			}
 			chatSection := fmt.Sprintf(
 				"%s\n%s",
-				func() string {
-					if m.viewChatModel.focus==FocusedBoxChatHistory {
-						return FocusedStyle.PaddingLeft(1).Render(m.viewChatModel.messageHistoryViewport.View())
-					} else {
-						return UnfocusedStyle.PaddingLeft(1).Render(m.viewChatModel.messageHistoryViewport.View())
-					}
-				}(),
+				titleRegBox.Render(
+					fmt.Sprintf("#%s (@%s)", channel, m.viewChatModel.id),
+					m.viewChatModel.messageHistoryViewport.View(),
+					m.viewChatModel.messageHistoryViewport.Width+1,
+					m.viewChatModel.focus==FocusedBoxChatHistory) ,
 				func() string {
 					if m.viewChatModel.focus==FocusedBoxChatInput {
 						return FocusedStyle.Render(m.viewChatModel.textarea.View())
@@ -170,16 +298,24 @@ func (m model) View() string {
 			);
 
 			channelList := func() string {
-				return UnfocusedStyle.Render(m.viewChatModel.channelListViewport.View())
+				if(m.viewChatModel.sidebarsEnabled){
+					return UnfocusedStyle.Render(m.viewChatModel.channelListViewport.View())
+				}else{
+					return ""
+				}
 			}()
 
 			userList := func() string {
+				if(m.viewChatModel.sidebarsEnabled){
 					if m.viewChatModel.focus==FocusedBoxUserList {
 						return FocusedStyle.Render(getFullUserListBar(m))
 					} else {
 						return UnfocusedStyle.Render(getFullUserListBar(m))
 					}
-				}();
+				}else{
+					return ""
+				}
+			}();
 			
 			return m.viewChatModel.alert.Render(
 				lipgloss.JoinHorizontal(lipgloss.Bottom, channelList, chatSection, userList))

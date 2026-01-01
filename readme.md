@@ -16,12 +16,13 @@ For now the code is all in one file, `main.go`, but I'm planning on cleaning it 
 Built using the charm bubbletea/wish stack
 
 ## Features
-- Users can create their own channels and make them public or private. They can invite users and change the banner (20x10 character) of their channel which shows on the right.
-- Messages and accounts are persistent and stored on the database. SSH in from anywhere with your credentials and catch up with what you've missed
-- Who's online? A member list on the right shows online users and in private channels also shows offline users
-- Discord/slack style interface with channels on the left, chat in the middle and users on the right
-- Channels with new messages show on the channel list on the left with the number of unread messages
-
+* Users can create their own channels and make them public or private. They can invite users and change the banner (20x10 character) of their channel which shows on the right.
+* Messages and accounts are persistent and stored on the database. SSH in from anywhere with your credentials and catch up with what you've missed
+* Who's online? A member list on the right shows online users and in private channels also shows offline users
+* Discord/slack style interface with channels on the left, chat in the middle and users on the right
+* Channels with new messages show on the channel list on the left with the number of unread messages
+  
+## For news and help join the discord server: https://discord.gg/q35CTJvngp
 
 ## Self-hosting
 
@@ -32,6 +33,7 @@ docker run -t -i -p 2222:2222 -e CLICOLOR_FORCE=1 -e COLORTERM=truecolor -e TERM
 ```
 
 Additonally a docker-compose file is in this repository. The format of the config.toml file is:
+
 ```bash
 Host = "0.0.0.0"
 Port = "2222"
@@ -53,16 +55,30 @@ PostgresPort = "5432"
 PostgresSSL = "disable"
 ```
 
+### SSH key
+SSH key is used from the path: `.ssh/id_ed25519"` (They will be auto created if you dont specify one).
 
-### Why use this?
+###  Why use this?
+- Communicate with friends in separated channels
+- Connect from anywhere with your credentials (ssh is installed everywhere)
 
+### Commands:
+ - /chan create <name>
+ - /chan public
+ - /chan private
+ - /chan invite <user>
+ - /chan uninvite <user>
+ - /chan join <name>
+ - /chan leave
+ - /chan banner <text>
 
 ### Features I'm working on adding:
-- Timezone support (Potential auto timezone detection using an ip geolocation db?)
+- Timezone support (Potential auto timezone detection using an ip geolocation db?) for message timestamps
 - Support for adding your pubkey for authentication alongside user/pass
 - Better channel ownership and moderation tools, for example having moderators and a simple permissions system
 
 ### Features I'd like to add in the future:
 - Friend requests/direct messages
+- More customization like theming and username colors
 - Connection to external authentication providers, for example LDAP
 - Custom bot/command support 

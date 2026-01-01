@@ -31,7 +31,6 @@ import (
 
 	"github.com/BurntSushi/toml"
 
-
 	"regexp"
 
 	"gorm.io/driver/sqlite"
@@ -104,6 +103,9 @@ func newApp(db *gorm.DB, config serverConfig) *app {
 	a.db = db
 	a.config=config
 
+	a.timezoneEstimator = timezoneEstimator{available: false}
+	a.timezoneEstimator.setupGeoipDatabase()
+
 	a.mu.Lock()
 	a.messages = make(map[string][]chatMsg)
 	a.channels = make(map[string]*Channel)
@@ -151,7 +153,7 @@ func newApp(db *gorm.DB, config serverConfig) *app {
 				ROW_NUMBER() OVER (PARTITION BY channel_id ORDER BY time DESC) as rn
 			FROM messages
 		) sub
-		WHERE rn <= 50
+		WHERE rn <= 200
 		ORDER BY channel_id, time DESC
 	`).Scan(&msgs)
 
@@ -291,15 +293,34 @@ func (a *app) ProgramHandler(s ssh.Session) *tea.Program {
 
 
 
-	tz := estimateTimezone(s)
+	tz := a.timezoneEstimator.estimateTimezone(s)
 
 	log.Infof("%s", tz.String())
 
 	model := initialModel(a, 120, 30, s)
 	model.app = a
 
+
 	// Only fetch channels if theyre actually authed
 
+
+	// Load timezone
+	// We can pull in other settings here in future and encapsulate them in a settings object
+	if(s.Context().Value("auth_status")=="ok"){
+		user, err := gorm.G[User](a.db).
+			Where("ID = ?", s.User()).
+			First(context.Background())
+
+		if(err!=nil){
+			log.Fatal("Err getting user")
+		}
+		tz, err := time.LoadLocation(user.Timezone)
+		
+		if(err==nil){
+			model.viewChatModel.timezone = tz
+		}
+		
+	}
 
 	updateChatLines(&model)
 	updateChannelList(&model)
@@ -323,6 +344,7 @@ func (a *app) ProgramHandler(s ssh.Session) *tea.Program {
 			loggedIn: true,
 			username: s.User(),
 			currentChannelId: "global",
+			inferredTimezone: tz,
 			joinedChannels: []string{},
 		}
 		a.mu.Unlock()
@@ -338,6 +360,7 @@ func (a *app) ProgramHandler(s ssh.Session) *tea.Program {
 			prog: p,
 			loggedIn: false,
 			username: "",
+			inferredTimezone: tz,
 			currentChannelId: "",
 		}
 		a.mu.Unlock()
@@ -460,6 +483,9 @@ func getNewUserListViewport(a *app, width int, height int, focus FocusedBox) vie
 
 func getNewMessageHistoryViewport(a *app, width int, height int, focus FocusedBox) viewport.Model {
 	mvp := viewport.New(max(0,width-48), max(0,height-7))
+	if(width<71){
+		mvp = viewport.New(max(0,width-3), max(0,height-7))
+	}
 	if(focus==FocusedBoxChatHistory){
 		VPEnableScrolling(&mvp)
 	}else{
@@ -563,7 +589,7 @@ func initialModel(a *app, width int, height int, sess ssh.Session) model {
 
 	passwordInput := textinput.New()
 	passwordInput.Placeholder = "Enter a password"
-	passwordInput.CharLimit = 25
+	passwordInput.CharLimit = 50
 	passwordInput.Width = 25
 	passwordInput.EchoMode=textinput.EchoPassword
 	passwordInput.Prompt=""
@@ -571,7 +597,7 @@ func initialModel(a *app, width int, height int, sess ssh.Session) model {
 	
 	passwordConfirmInput := textinput.New()
 	passwordConfirmInput.Placeholder = ""
-	passwordConfirmInput.CharLimit = 25
+	passwordConfirmInput.CharLimit = 50
 	passwordConfirmInput.Width = 25
 	passwordConfirmInput.EchoMode=textinput.EchoPassword
 	passwordConfirmInput.Prompt=""
@@ -615,6 +641,7 @@ func initialModel(a *app, width int, height int, sess ssh.Session) model {
 				memberList: a.channelMemberListCache["global"],
 				focus: FocusedBoxChatInput,	
 				alert: *bubbleup.NewAlertModel(40, false, 2),
+				timezone: time.UTC,
 			},
 			viewRegistrationModel: viewRegistrationModel{
 				usernameInput: usernameInput,
@@ -659,7 +686,7 @@ func initialModel(a *app, width int, height int, sess ssh.Session) model {
 				memberList: a.channelMemberListCache["global"],
 				focus: FocusedBoxChatInput,
 				alert: *bubbleup.NewAlertModel(40, false, 2),
-
+				timezone: time.UTC,
 			},
 			viewRegistrationModel: viewRegistrationModel{
 				FocusedBox: RegistrationPasswordConfirmFocused,
@@ -677,126 +704,6 @@ func initialModel(a *app, width int, height int, sess ssh.Session) model {
 
 func (m model) Init() tea.Cmd {
 	return m.viewChatModel.alert.Init()
-}
-var (
-    boldRegex   = regexp.MustCompile(`\*\*(.+?)\*\*`)
-    italicRegex = regexp.MustCompile(`\*(.+?)\*`)
-    codeRegex   = regexp.MustCompile("`([^`]+)`")
-)
-
-func simpleMarkdown(text string) string {
-    text = boldRegex.ReplaceAllString(text, "\033[1m$1\033[0m")
-    text = italicRegex.ReplaceAllString(text, "\033[3m$1\033[0m")
-    text = codeRegex.ReplaceAllString(text, "\033[7m$1\033[0m")
-    return text
-}
-
-
-func updateUserList(m *model){
-	var content strings.Builder
-    
-    onlineStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("10"))
-	offlineStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("240"))
-
-
-    for _, v := range m.viewChatModel.memberList.onlineMembers {
-        line := fmt.Sprintf("@%s", v.username)
-        content.WriteString(onlineStyle.Render(line) + "\n")
-    }
-
-    for _, v := range m.viewChatModel.memberList.offlineMembers {
-        line := fmt.Sprintf("@%s", v)
-        content.WriteString(offlineStyle.Render(line) + "\n")
-    }
-
-    m.viewChatModel.userListViewport.SetContent(content.String())
-}
-
-func updateChannelList(m *model){
-
-	focused := m.viewChatModel.focus == FocusedBoxChannelList
-
-	channelListText := ""
-
-	currentChannel := lipgloss.NewStyle().Background(lipgloss.Color("240")).Foreground(lipgloss.Color("15"))
-	currentChannelFocused := lipgloss.NewStyle().Background(lipgloss.Color("84")).Foreground(lipgloss.Color("240"))
-	otherChannel := lipgloss.NewStyle().Foreground(lipgloss.Color("243"))
-	otherChannelUnread := lipgloss.NewStyle().Foreground(lipgloss.Color("15"))
-	notificationCount := lipgloss.NewStyle().Foreground(lipgloss.Color("87"))
-	for _, v := range m.viewChatModel.channels {
-		if(m.viewChatModel.channels[m.viewChatModel.currentChannel]==v){
-			if(focused){
-				channelListText+=currentChannelFocused.Render(fmt.Sprintf("# %-18s", v.channelId))+"\n"
-			}else{
-				channelListText+=currentChannel.Render(fmt.Sprintf("# %-18s", v.channelId))+"\n"
-			}
-		}else{
-			if(v.unread>0){
-				if(v.unread>9){
-					channelListText+=otherChannelUnread.Render(fmt.Sprintf("# %-13s  ", v.channelId))+
-					notificationCount.Render("9+ ")+"\n"
-				}else{
-					channelListText+=otherChannelUnread.Render(fmt.Sprintf("# %-13s   ", v.channelId))+
-					notificationCount.Render(fmt.Sprintf("%d  ", v.unread))+"\n"
-				}
-			}else{
-				channelListText+=otherChannel.Render(fmt.Sprintf("# %-18s", v.channelId))+"\n"
-			}
-		}
-	}
-
-	if(m.viewChatModel.currentChannel<len(m.viewChatModel.channels)){
-		channel, ok := m.app.channels[m.viewChatModel.channels[m.viewChatModel.currentChannel].channelId]
-		if(ok){
-			m.viewChatModel.channelBanner = channel.Banner
-		}
-	}
-
-
-	m.viewChatModel.channelListViewport.SetContent(channelListText)
-}
-
-func updateChatLines(m *model) {
-	messageText := ""
-
-
-	botMsg := lipgloss.NewStyle().Background(lipgloss.Color("63")).Foreground(lipgloss.Color("15")).Render(" BOT ")
-	adminMsg := lipgloss.NewStyle().Foreground(lipgloss.Color("78")).Render("(admin)")
-
-	botSenderStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("121"))
-
-
-	for i, v := range m.viewChatModel.messages {
-		newMessage := ""
-		// timestamp := m.viewChatModel.dateStyle.Render(fmt.Sprintf(" %02d:%02d UTC ", v.time.Hour(), v.time.Minute()))
-		loc, err := time.LoadLocation("America/New_York")
-		if err != nil {
-			panic(err)
-		}
-		
-		timestamp := v.time.In(loc)
-		time := m.viewChatModel.dateStyle.Render(fmt.Sprintf(" %02d:%02d UTC ", timestamp.Hour(), timestamp.Minute()))
-		if(i==0 || m.viewChatModel.messages[i-1].sender!=v.sender){
-			if(v.sender==m.app.config.BotUsername){
-				newMessage+="\n"+botSenderStyle.Render(v.sender)+" "+botMsg+""+time+"\n"
-			}else if(v.sender==m.app.config.AdminUsername){
-				newMessage+="\n"+m.viewChatModel.senderStyle.Render(v.sender)+" "+adminMsg+""+time+"\n"
-			}else{
-				newMessage+="\n"+m.viewChatModel.senderStyle.Render(v.sender)+time+"\n"
-			}
-		}
-		newMessage+=simpleMarkdown(v.text)+"\n"
-		messageText+=newMessage
-	}
-
-	content := lipgloss.NewStyle().
-		Width(m.viewChatModel.messageHistoryViewport.Width).
-		Render(messageText)
-
-	m.viewChatModel.messageHistoryViewport.SetContent(content)
-	if(m.viewChatModel.focus!=FocusedBoxChatHistory){
-		m.viewChatModel.messageHistoryViewport.GotoBottom()
-	}
 }
 
 func reloadMessagesChannelSwitch(m *model){
@@ -1121,7 +1028,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					}else if(msg.Type == tea.KeyRight && m.viewChatModel.focus == FocusedBoxChatInput){
 						info := m.viewChatModel.textarea.LineInfo()
 						// Only change focus if the cursor is at the end of the line
-						if(info.CharOffset>=info.CharWidth-1){
+						// And at the last line
+						if(info.CharOffset>=info.CharWidth-1 && info.RowOffset==info.Height-1){
 							m.viewChatModel.focus = FocusedBoxUserList
 							updatedChatFocus(&m)
 						}
@@ -1153,7 +1061,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.viewChatModel.channelListViewport = getNewChannelListViewport(m.app, msg.Width, msg.Height, m.viewChatModel.focus)
 				m.viewChatModel.userListViewport = getNewUserListViewport(m.app, msg.Width, msg.Height, m.viewChatModel.focus)
 				m.viewChatModel.messageHistoryViewport = getNewMessageHistoryViewport(m.app, msg.Width, msg.Height, m.viewChatModel.focus)
-				m.viewChatModel.textarea.SetWidth(max(0,msg.Width-47))
+				if(msg.Width<71){
+					m.viewChatModel.sidebarsEnabled = false
+					m.viewChatModel.textarea.SetWidth(max(0,msg.Width-2))
+				}else{
+					m.viewChatModel.sidebarsEnabled = true
+					m.viewChatModel.textarea.SetWidth(max(0,msg.Width-47))
+				}
 				updateChannelList(&m)
 				updateChatLines(&m)
 				updateUserList(&m)
@@ -1173,7 +1087,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			case channelList:
 				m.viewChatModel.channels = msg.channels
 				if(msg.firstjoin){
-					sendIslebotMessagePermanent(m.app, fmt.Sprintf("A new user joined for the first time! Welcome @%s. Run /help for information", m.viewChatModel.id), "global")
+					sendIslebotMessagePermanent(m.app, fmt.Sprintf("A new user joined for the first time! Welcome @%s. Run /help for information. Your timezone was set to %s, change it with /tz", m.viewChatModel.id, m.viewChatModel.timezone.String()), "global")
 
 				}
 				updateChannelList(&m)
@@ -1255,6 +1169,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 								return m,nil
 							}
 
+							re := regexp.MustCompile(`^[a-zA-Z0-9_-]{1,10}$`)
+							if (!re.MatchString(newUsername)) {
+								m.viewRegistrationModel.feedbackViewport.SetContent("Username contains bad chars")
+								return m,nil
+							}
+
 							if(newUsername==m.app.config.BotUsername){
 								m.viewRegistrationModel.feedbackViewport.SetContent("You cannot have this username")
 								return m,nil	
@@ -1272,10 +1192,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 								return m,nil
 							}
 
+							tz := m.app.sessions[m.viewChatModel.id].inferredTimezone
+
 							err = gorm.G[User](m.db).Create(context.Background(), &User{
 								ID: newUsername,
 								Password: hashedPass,
 								Channels: []Channel{*m.app.channels["global"]},
+								Timezone: tz.String(),
 							})
 
 							if(err!=nil){
@@ -1293,6 +1216,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 									loggedIn: true,
 									username: newUsername,
 									currentChannelId: "global",
+									inferredTimezone: tz,
 									joinedChannels: []string{},
 								}
 								// Set username in sessionUsernames so session closing can be handled
@@ -1302,7 +1226,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 								// Add user to global channel
 								addUserToChannel(m.app, newUsername, "global")
 								m.viewMode=viewChat
-
+								m.viewChatModel.timezone = tz
 								return m, tea.Batch(
 									func() tea.Msg {
 										return channelList(channelList{

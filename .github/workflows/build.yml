@@ -10,68 +10,80 @@ env:
 
 jobs:
   build-amd64:
-    name: Build amd64 (native)
+    name: Build amd64
     runs-on: ubuntu-latest
     environment: main
-
     steps:
-      - uses: actions/checkout@v3
-
-      - uses: docker/setup-buildx-action@v2
-
-      - uses: docker/login-action@v2
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKER_USERNAME }}
           password: ${{ secrets.DOCKER_PASSWORD }}
-
+      
       - name: Build and push amd64
-        run: |
-          docker buildx build \
-            --platform linux/amd64 \
-            -t $IMAGE:$TAG-amd64 \
-            --push .
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: ${{ env.IMAGE }}:${{ env.TAG }}-amd64
+          cache-from: type=gha,scope=amd64
+          cache-to: type=gha,mode=max,scope=amd64
 
   build-arm64:
-    name: Build arm64 (buildx + QEMU)
+    name: Build arm64
     runs-on: ubuntu-latest
     environment: main
-
     steps:
-      - uses: actions/checkout@v3
-
-      - uses: docker/setup-qemu-action@v2
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
         with:
-          platforms: arm64
-
-      - uses: docker/setup-buildx-action@v2
-
-      - uses: docker/login-action@v2
+          platforms: linux/arm64
+      
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKER_USERNAME }}
           password: ${{ secrets.DOCKER_PASSWORD }}
-
+      
       - name: Build and push arm64
-        run: |
-          docker buildx build \
-            --platform linux/arm64 \
-            -t $IMAGE:$TAG-arm64 \
-            --push .
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/arm64
+          push: true
+          tags: ${{ env.IMAGE }}:${{ env.TAG }}-arm64
+          cache-from: type=gha,scope=arm64
+          cache-to: type=gha,mode=max,scope=arm64
 
   manifest:
     name: Create multi-arch manifest
     needs: [build-amd64, build-arm64]
     runs-on: ubuntu-latest
-
+    environment: main
     steps:
-      - uses: docker/login-action@v2
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKER_USERNAME }}
           password: ${{ secrets.DOCKER_PASSWORD }}
-
-      - name: Create and push manifest
+      
+      - name: Create and push multi-arch manifest
         run: |
-          docker manifest create $IMAGE:$TAG \
-            $IMAGE:$TAG-amd64 \
-            $IMAGE:$TAG-arm64
-
-          docker manifest push $IMAGE:$TAG
+          docker buildx imagetools create -t ${{ env.IMAGE }}:${{ env.TAG }} \
+            ${{ env.IMAGE }}:${{ env.TAG }}-amd64 \
+            ${{ env.IMAGE }}:${{ env.TAG }}-arm64

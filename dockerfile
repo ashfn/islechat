@@ -5,7 +5,7 @@ COPY go.mod go.sum ./
 RUN go mod download && go mod verify
 COPY . .
 RUN apk add --no-cache gcc musl-dev
-RUN CGO_ENABLED=1 go build -o isle-chat .
+RUN CGO_ENABLED=1 go build -o isle-chat ./src
 FROM alpine:3.19
 RUN addgroup -g 1000 islechat && \
     adduser -D -u 1000 -G islechat -h /home/islechat islechat

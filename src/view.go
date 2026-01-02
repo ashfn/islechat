@@ -109,13 +109,17 @@ func updateChatLines(m *model) {
 		timestamp := v.time.In(m.viewChatModel.timezone)
 		timeRendered := m.viewChatModel.dateStyle.Render(fmt.Sprintf(" %02d:%02d ", timestamp.Hour(), timestamp.Minute()))
 
-		// If it was betwen 24 and 48h ago 'yesterday at x'
-		if(time.Now().UnixMilli()-timestamp.UnixMilli() > 24*3600*1000){
-			timeRendered = m.viewChatModel.dateStyle.Render(fmt.Sprintf(" Yesterday at %02d:%02d ", timestamp.Hour(), timestamp.Minute()))
-		}
+		now := time.Now()
+		nowDate := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
+		timestampDate := time.Date(timestamp.Year(), timestamp.Month(), timestamp.Day(), 0, 0, 0, 0, timestamp.Location())
+		daysDiff := int(nowDate.Sub(timestampDate).Hours() / 24)
 
-		if(time.Now().UnixMilli()-timestamp.UnixMilli() > 48*3600*1000){
-			timeRendered = m.viewChatModel.dateStyle.Render(fmt.Sprintf(" %02d/%02d/%02d, %02d:%02d ", timestamp.Day(), timestamp.Month(), timestamp.Year(), timestamp.Hour(), timestamp.Minute()))
+		// More than 1 calendar day ago
+		if daysDiff > 1 {
+			timeRendered = m.viewChatModel.dateStyle.Render(fmt.Sprintf(" %02d/%02d/%04d, %02d:%02d ", timestamp.Day(), timestamp.Month(), timestamp.Year(), timestamp.Hour(), timestamp.Minute()))
+		} else if daysDiff == 1 {
+			// Exactly 1 calendar day ago 
+			timeRendered = m.viewChatModel.dateStyle.Render(fmt.Sprintf(" Yesterday at %02d:%02d ", timestamp.Hour(), timestamp.Minute()))
 		}
 
 		if(i==0 || m.viewChatModel.messages[i-1].sender!=v.sender || m.viewChatModel.messages[i].time.UnixMilli()-m.viewChatModel.messages[i-1].time.UnixMilli()>300000){

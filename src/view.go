@@ -70,25 +70,63 @@ func updateChannelList(m *model) {
 	otherChannel := lipgloss.NewStyle().Foreground(lipgloss.Color("243"))
 	otherChannelUnread := lipgloss.NewStyle().Foreground(lipgloss.Color("15"))
 	notificationCount := lipgloss.NewStyle().Foreground(lipgloss.Color("87"))
-	for _, v := range m.viewChatModel.channels {
-		if m.viewChatModel.channels[m.viewChatModel.currentChannel] == v {
-			if focused {
-				channelListText += currentChannelFocused.Render(fmt.Sprintf("# %-18s", v.channelId)) + "\n"
-			} else {
-				channelListText += currentChannel.Render(fmt.Sprintf("# %-18s", v.channelId)) + "\n"
+	notificationAlertCount := lipgloss.NewStyle().Foreground(lipgloss.Color("203")).Bold(true)
+
+	notificationTotal := m.viewChatModel.notificationUnread
+
+	notificationStyle := otherChannel
+	if notificationTotal > 0 {
+		notificationStyle = otherChannelUnread
+	}
+	if m.viewChatModel.viewingNotifications {
+		notificationStyle = currentChannel
+	}
+	if focused && m.viewChatModel.channelListCursor == -1 {
+		notificationStyle = currentChannelFocused
+	}
+
+	badgeText := notificationBadgeText(notificationTotal)
+
+	notificationLabel := notificationStyle.Render(fmt.Sprintf("! %-13s  ", "notifications"))
+	badge := ""
+	if badgeText != "" {
+		badgeStyle := notificationAlertCount
+		if focused && m.viewChatModel.channelListCursor == -1 {
+			badgeStyle = badgeStyle.Copy().Background(lipgloss.Color("84"))
+		} else if m.viewChatModel.viewingNotifications {
+			badgeStyle = badgeStyle.Copy().Background(lipgloss.Color("240"))
+		}
+		badge = badgeStyle.Render(fmt.Sprintf("%-3s", badgeText))
+	} else {
+		// Keep the highlight background consistent for the full row.
+		badge = notificationStyle.Render("   ")
+	}
+	channelListText += notificationLabel + badge + "\n"
+
+	for i, v := range m.viewChatModel.channels {
+		selected := !m.viewChatModel.viewingNotifications && m.viewChatModel.currentChannel == i
+		focusedEntry := focused && m.viewChatModel.channelListCursor == i
+
+		// choose style for the channel name
+		nameStyle := otherChannel
+		if v.unread > 0 {
+			nameStyle = otherChannelUnread
+		}
+		if selected {
+			nameStyle = currentChannel
+		}
+		if focusedEntry {
+			nameStyle = currentChannelFocused
+		}
+
+		if v.unread > 0 {
+			countText := fmt.Sprintf("%d  ", v.unread)
+			if v.unread > 9 {
+				countText = "9+ "
 			}
+			channelListText += nameStyle.Render(fmt.Sprintf("# %-13s  ", v.channelId)) + notificationCount.Render(countText) + "\n"
 		} else {
-			if v.unread > 0 {
-				if v.unread > 9 {
-					channelListText += otherChannelUnread.Render(fmt.Sprintf("# %-13s  ", v.channelId)) +
-						notificationCount.Render("9+ ") + "\n"
-				} else {
-					channelListText += otherChannelUnread.Render(fmt.Sprintf("# %-13s   ", v.channelId)) +
-						notificationCount.Render(fmt.Sprintf("%d  ", v.unread)) + "\n"
-				}
-			} else {
-				channelListText += otherChannel.Render(fmt.Sprintf("# %-18s", v.channelId)) + "\n"
-			}
+			channelListText += nameStyle.Render(fmt.Sprintf("# %-18s", v.channelId)) + "\n"
 		}
 	}
 

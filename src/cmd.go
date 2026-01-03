@@ -12,6 +12,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/charmbracelet/log"
+
 	"gorm.io/gorm"
 )
 
@@ -478,6 +480,118 @@ func cmdSuggestionsEqual(a, b []cmdSuggestion) bool {
 	return true
 }
 
+func normalizeUserPrefix(prefix string) string {
+	prefix = strings.TrimSpace(prefix)
+	prefix = strings.TrimPrefix(prefix, "@")
+	return prefix
+}
+
+func userArgSuggestions(m *model, base, prefix string) []cmdSuggestion {
+	prefix = normalizeUserPrefix(prefix)
+	prefixLower := strings.ToLower(prefix)
+
+	out := make([]cmdSuggestion, 0, 50)
+	seen := make(map[string]struct{})
+
+	// Start with mention-style suggestions for the current channel.
+	for _, s := range mentionSuggestions(m, prefix) {
+		username := strings.TrimPrefix(s.Display, "@")
+		cmd := base + " " + username
+		if _, ok := seen[cmd]; ok {
+			continue
+		}
+		seen[cmd] = struct{}{}
+		out = append(out, cmdSuggestion{Display: cmd, Insert: cmd, Desc: s.Desc})
+		if len(out) >= 50 {
+			return out
+		}
+	}
+
+	if m == nil || m.app == nil || m.app.db == nil {
+		return out
+	}
+
+	type scored struct {
+		name  string
+		score int
+	}
+
+	candidates := make([]scored, 0)
+
+	// If no prefix, show online users first.
+	if prefixLower == "" {
+		m.app.mu.RLock()
+		for username, sess := range m.app.sessions {
+			if sess == nil || !sess.loggedIn || username == "" {
+				continue
+			}
+			candidates = append(candidates, scored{name: username, score: 0})
+		}
+		m.app.mu.RUnlock()
+	}
+
+	// Pull matching users from the DB. Case-insensitive filtering.
+	// We keep results bounded and rank in Go.
+	var ids []string
+	like := "%"
+	if prefixLower != "" {
+		like = "%" + prefixLower + "%"
+	}
+	_ = m.app.db.WithContext(context.Background()).
+		Model(&User{}).
+		Select("id").
+		Where("LOWER(id) LIKE ?", like).
+		Order("id ASC").
+		Limit(200).
+		Pluck("id", &ids).Error
+
+	for _, username := range ids {
+		lower := strings.ToLower(username)
+		score := 0
+		if prefixLower != "" {
+			switch {
+			case strings.HasPrefix(lower, prefixLower):
+				score = 0
+			case strings.Contains(lower, prefixLower):
+				score = 1
+			default:
+				continue
+			}
+		}
+		candidates = append(candidates, scored{name: username, score: score})
+	}
+
+	slices.SortFunc(candidates, func(a, b scored) int {
+		if a.score != b.score {
+			return a.score - b.score
+		}
+		return strings.Compare(a.name, b.name)
+	})
+
+	for _, cand := range candidates {
+		cmd := base + " " + cand.name
+		if _, ok := seen[cmd]; ok {
+			continue
+		}
+		seen[cmd] = struct{}{}
+
+		desc := "User"
+		m.app.mu.RLock()
+		sess, ok := m.app.sessions[cand.name]
+		m.app.mu.RUnlock()
+		if ok && sess != nil && sess.loggedIn {
+			desc = "Online"
+		}
+
+		out = append(out, cmdSuggestion{Display: cmd, Insert: cmd, Desc: desc})
+		if len(out) >= 50 {
+			break
+		}
+	}
+
+	return out
+}
+
 func suggestCommands(m *model, input string) []cmdSuggestion {
 	// Input is the raw textarea value, including leading '/'.
 	raw := strings.TrimPrefix(input, "/")
@@ -533,6 +647,9 @@ func suggestCommands(m *model, input string) []cmdSuggestion {
 				if node.Name == "tz" {
 					return timezoneSuggestions(m, base, "")
 				}
+				if node.ArgHint == "<user>" {
+					return userArgSuggestions(m, base, "")
+				}
 				display := base + " " + node.ArgHint
 				insert := base + " "
 				return []cmdSuggestion{{Display: display, Insert: insert, Desc: node.Desc}}
@@ -564,6 +681,9 @@ func suggestCommands(m *model, input string) []cmdSuggestion {
 			base := "/" + strings.Join(path, " ")
 			if node.Name == "tz" {
 				return timezoneSuggestions(m, base, tok)
+			}
+			if node.ArgHint == "<user>" {
+				return userArgSuggestions(m, base, tok)
 			}
 			display := base + " " + tok
 			return []cmdSuggestion{{Display: display, Insert: display, Desc: node.Desc}}
@@ -664,6 +784,7 @@ func runChanCreate(m *model, args []string) {
 	for i, c := range m.viewChatModel.channels {
 		if c.channelId == oldCurChan {
 			m.viewChatModel.currentChannel = i
+			m.viewChatModel.channelListCursor = m.viewChatModel.currentChannel
 		}
 	}
 
@@ -739,6 +860,8 @@ func runChanJoin(m *model, args []string) {
 		return
 	}
 
+	refreshNotifications(m.app, userId)
+
 	addUserToChannel(m.app, userId, channelName)
 	updateChannelMemberList(updateChannelMemberListParameters{
 		app:       m.app,
@@ -792,6 +915,7 @@ func runChanInvite(m *model, args []string) {
 
 	err = gorm.G[Invite](m.db).Create(context.Background(), &Invite{UserID: targetUser, ChannelID: channel.ID})
 	if err == nil {
+		refreshNotifications(m.app, targetUser)
 		sendIslebotMessage(m, fmt.Sprintf("The invite was sent to @%s, they can now join with /chan join %s", targetUser, channel.ID))
 		return
 	}
@@ -832,6 +956,8 @@ func runChanUninvite(m *model, args []string) {
 		return
 	}
 
+	refreshNotifications(m.app, targetUser)
+
 	sendIslebotMessage(m, fmt.Sprintf("The user @%s was uninvited from #%s", targetUser, channel.ID))
 }
 
@@ -859,11 +985,25 @@ func runChanPublic(m *model, args []string) {
 		return
 	}
 
+	var invitedUsers []string
+	err = m.db.WithContext(context.Background()).
+		Table("invites").
+		Where("channel_id = ?", channel.ID).
+		Pluck("user_id", &invitedUsers).
+		Error
+	if err != nil {
+		log.Error("Failed to fetch invitees for channel", "channel", channel.ID, "error", err)
+	}
+
 	_, err = gorm.G[Invite](m.db).
 		Where("channel_id = ?", channel.ID).
 		Delete(context.Background())
 	if err != nil {
 		sendIslebotMessage(m, fmt.Sprintf("Whilst making #%s public, invites could not be deleted", channel.ID))
+	}
+
+	for _, userID := range invitedUsers {
+		refreshNotifications(m.app, userID)
 	}
 
 	sendIslebotMessage(m, fmt.Sprintf("#%s is now public", channel.ID))
@@ -1023,6 +1163,7 @@ func runChanLeave(m *model, args []string) {
 	id := m.viewChatModel.currentChannel
 	m.viewChatModel.channels = append(m.viewChatModel.channels[:id], m.viewChatModel.channels[id+1:]...)
 	m.viewChatModel.currentChannel = 0
+	m.viewChatModel.channelListCursor = 0
 
 	m.app.mu.Lock()
 	m.app.sessions[m.viewChatModel.id].currentChannelId = "global"
@@ -1076,11 +1217,32 @@ func runChanDelete(m *model, args []string) {
 		})
 	}
 
+	var invitedUsers []string
+	err := m.db.WithContext(context.Background()).
+		Table("invites").
+		Where("channel_id = ?", channel.ID).
+		Pluck("user_id", &invitedUsers).
+		Error
+	if err != nil {
+		log.Error("Failed to load invites for channel delete", "channel", channel.ID, "error", err)
+	}
+
+	_, delErr := gorm.G[Invite](m.db).
+		Where("channel_id = ?", channel.ID).
+		Delete(context.Background())
+	if delErr != nil {
+		log.Error("Failed to delete invites for channel", "channel", channel.ID, "error", delErr)
+	}
+
+	for _, userID := range invitedUsers {
+		refreshNotifications(m.app, userID)
+	}
+
 	m.app.mu.Lock()
 	delete(m.app.channels, channel.ID)
 	m.app.mu.Unlock()
 
-	_, err := gorm.G[Channel](m.db).
+	_, err = gorm.G[Channel](m.db).
 		Where("id = ?", channel.ID).
 		Delete(context.Background())
 	if err != nil {

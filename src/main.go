@@ -191,6 +191,18 @@ func newApp(db *gorm.DB, config serverConfig) *app {
 					a.mu.Unlock()
 					if !ok {
 						ctx.SetValue("auth_status", "ok")
+						previousSeen := user.LastSeenAt
+						if previousSeen.IsZero() {
+							previousSeen = user.LastLoginAt
+						}
+						ctx.SetValue("previous_last_seen_at", previousSeen)
+						now := time.Now().UTC()
+						_, updateErr := gorm.G[User](db).
+							Where("id = ?", username).
+							Update(context.Background(), "last_login_at", now)
+						if updateErr != nil {
+							log.Error("Failed to update last login", "user", username, "error", updateErr)
+						}
 					} else {
 						ctx.SetValue("auth_status", "fail")
 						ctx.SetValue("auth_msg", "You are already loggedin elsewhere")
@@ -270,9 +282,17 @@ func (a *app) CleanupMiddleware(next ssh.Handler) ssh.Handler {
 					userId: username,
 					change: UserChannelOffline,
 				})
+				now := time.Now().UTC()
+				_, updateErr := gorm.G[User](a.db).
+					Where("id = ?", username).
+					Update(context.Background(), "last_seen_at", now)
+				if updateErr != nil {
+					log.Error("Failed to update last seen", "user", username, "error", updateErr)
+				}
 				a.mu.Lock()
 				delete(a.sessions, username)
 				a.mu.Unlock()
+
 			}
 		}()
 	}
@@ -305,6 +325,11 @@ func (a *app) ProgramHandler(s ssh.Session) *tea.Program {
 			model.viewChatModel.timezone = tz
 		}
 
+		if val := s.Context().Value("previous_last_seen_at"); val != nil {
+			if lastSeen, ok := val.(time.Time); ok {
+				model.viewChatModel.lastSeenAt = lastSeen
+			}
+		}
 	}
 
 	updateChatLines(&model)
@@ -336,6 +361,7 @@ func (a *app) ProgramHandler(s ssh.Session) *tea.Program {
 			channels:  joinedHandleChannels(&model),
 			firstjoin: false,
 		}))
+		refreshNotifications(a, s.User())
 	} else {
 		// We give it a temporary 'username' using the session id
 
@@ -490,18 +516,18 @@ func joinedHandleChannels(m *model) []userChannelState {
 
 	channels := make([]userChannelState, 0)
 
-	var channelIDs []string
-
 	channels = append(channels, userChannelState{
 		channelId: "global",
 		unread:    0,
 	})
 
+	joinedChannelIDs := make([]string, 0)
+
 	// We query the join table specifically to get the IDs for this User
 	err := m.app.db.Table("user_channels").
 		Where("user_id = ?", m.viewChatModel.id).
 		Order("channel_id DESC").
-		Pluck("channel_id", &channelIDs).Error
+		Pluck("channel_id", &joinedChannelIDs).Error
 
 	if err != nil {
 		log.Error(err)
@@ -509,7 +535,7 @@ func joinedHandleChannels(m *model) []userChannelState {
 	}
 
 	// Adding the channels for the user
-	for _, channel := range channelIDs {
+	for _, channel := range joinedChannelIDs {
 		if channel != "global" {
 			channels = append(channels, userChannelState{
 				channelId: channel,
@@ -518,9 +544,49 @@ func joinedHandleChannels(m *model) []userChannelState {
 		}
 	}
 
+	uniqueChannelIDs := []string{"global"}
+	seen := map[string]struct{}{"global": struct{}{}}
+	for _, channel := range joinedChannelIDs {
+		if _, ok := seen[channel]; ok {
+			continue
+		}
+		seen[channel] = struct{}{}
+		uniqueChannelIDs = append(uniqueChannelIDs, channel)
+	}
+
+	unreadByChannel := make(map[string]int)
+	if !m.viewChatModel.lastSeenAt.IsZero() {
+		type unreadResult struct {
+			ChannelID string
+			Count     int64
+		}
+
+		var results []unreadResult
+		err = m.app.db.Model(&Message{}).
+			Select("channel_id, COUNT(*) as count").
+			Where("channel_id IN ?", uniqueChannelIDs).
+			Where("time > ?", m.viewChatModel.lastSeenAt).
+			Where("sender_id <> ?", m.viewChatModel.id).
+			Group("channel_id").
+			Find(&results).Error
+		if err != nil {
+			log.Error(err)
+		} else {
+			for _, row := range results {
+				unreadByChannel[row.ChannelID] = int(row.Count)
+			}
+		}
+	}
+
+	for i := range channels {
+		if count, ok := unreadByChannel[channels[i].channelId]; ok {
+			channels[i].unread = count
+		}
+	}
+
 	// Adding the user to online member list for their channels
 	m.app.mu.Lock()
-	for _, channel := range channelIDs {
+	for _, channel := range uniqueChannelIDs {
 
 		m.app.sessions[m.viewChatModel.id].joinedChannels = append(m.app.sessions[m.viewChatModel.id].joinedChannels, channel)
 	}
@@ -534,6 +600,101 @@ func joinedHandleChannels(m *model) []userChannelState {
 	})
 
 	return channels
+}
+
+func collectInviteNotificationsForUser(app *app, userID string) ([]userNotification, error) {
+	if app == nil || userID == "" {
+		return nil, nil
+	}
+
+	type inviteCount struct {
+		ChannelID string
+		Count     int64
+	}
+
+	var rows []inviteCount
+	err := app.db.Table("invites").
+		Select("channel_id, COUNT(*) as count").
+		Where("user_id = ?", userID).
+		Group("channel_id").
+		Order("channel_id ASC").
+		Find(&rows).Error
+	if err != nil {
+		return nil, err
+	}
+
+	notifications := make([]userNotification, 0, len(rows))
+	for _, row := range rows {
+		notifications = append(notifications, userNotification{
+			id:    fmt.Sprintf("invite:%s", row.ChannelID),
+			label: row.ChannelID,
+			count: int(row.Count),
+			kind:  "invite",
+		})
+	}
+
+	return notifications, nil
+}
+
+func collectNotificationsForUser(app *app, userID string) ([]userNotification, error) {
+	all := make([]userNotification, 0)
+
+	inviteNotifications, err := collectInviteNotificationsForUser(app, userID)
+	if err != nil {
+		return nil, err
+	}
+	if len(inviteNotifications) > 0 {
+		all = append(all, inviteNotifications...)
+	}
+
+	return all, nil
+}
+
+func refreshNotifications(app *app, userID string) {
+	if app == nil || userID == "" {
+		return
+	}
+
+	notifications, err := collectNotificationsForUser(app, userID)
+	if err != nil {
+		log.Error("Failed to load notifications", "user", userID, "error", err)
+		return
+	}
+
+	dbUser, err := gorm.G[User](app.db).
+		Select("id", "last_notification_seen_at").
+		Where("id = ?", userID).
+		First(context.Background())
+	if err != nil {
+		log.Error("Failed to load notification state", "user", userID, "error", err)
+		return
+	}
+
+	var unreadInvites int64
+	if dbUser.LastNotificationSeenAt.IsZero() {
+		// No record of having seen notifications yet.
+		err = app.db.Model(&Invite{}).
+			Where("user_id = ?", userID).
+			Count(&unreadInvites).Error
+	} else {
+		err = app.db.Model(&Invite{}).
+			Where("user_id = ?", userID).
+			Where("created_at > ?", dbUser.LastNotificationSeenAt).
+			Count(&unreadInvites).Error
+	}
+	if err != nil {
+		log.Error("Failed to calculate notification unread", "user", userID, "error", err)
+		return
+	}
+
+	app.mu.RLock()
+	session, ok := app.sessions[userID]
+	app.mu.RUnlock()
+	if !ok || session == nil || !session.loggedIn {
+		return
+	}
+
+	go session.prog.Send(notificationUpdate{notifications: notifications, unread: int(unreadInvites)})
 }
 
 func initialModel(a *app, width int, height int, sess ssh.Session) model {
@@ -605,6 +766,7 @@ func initialModel(a *app, width int, height int, sess ssh.Session) model {
 				senderStyle:            lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("5")),
 				dateStyle:              lipgloss.NewStyle().Foreground(lipgloss.Color("238")),
 				currentChannel:         0,
+				channelListCursor:      0,
 				channels:               channelList,
 				channelBanner: `⠀⣠⣴⣦⣽⣿⣾⣿⣷⣟⣋⡁⠀⠀ 
 								⠀⢀⣬⣽⣿⣿⣿⣿⣿⣿⣿⠿⠗⠀ 
@@ -648,6 +810,7 @@ func initialModel(a *app, width int, height int, sess ssh.Session) model {
 				senderStyle:            lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("5")),
 				dateStyle:              lipgloss.NewStyle().Foreground(lipgloss.Color("238")),
 				currentChannel:         0,
+				channelListCursor:      0,
 				channels:               channelList,
 				err:                    nil,
 				channelBanner: `⠀⣠⣴⣦⣽⣿⣾⣿⣷⣟⣋⡁⠀⠀ 
@@ -831,13 +994,94 @@ func updateChannelMemberList(params updateChannelMemberListParameters) {
 }
 
 func sendIslebotMessage(m *model, msg string) {
+	channelID := m.viewChatModel.channels[m.viewChatModel.currentChannel].channelId
+	if m.viewChatModel.viewingNotifications {
+		channelID = "notifications"
+	}
 	m.viewChatModel.messages = append(m.viewChatModel.messages, chatMsg{
 		sender:  m.app.config.BotUsername,
 		text:    msg,
 		time:    time.Now(),
-		channel: m.viewChatModel.channels[m.viewChatModel.currentChannel].channelId,
+		channel: channelID,
 	})
 	updateChatLines(m)
+}
+
+func buildNotificationMessages(m *model) []chatMsg {
+	msgs := make([]chatMsg, 0)
+	if len(m.viewChatModel.notifications) == 0 {
+		msgs = append(msgs, chatMsg{
+			sender:  m.app.config.BotUsername,
+			text:    "No notifications",
+			time:    time.Now(),
+			channel: "notifications",
+		})
+		return msgs
+	}
+
+	for _, n := range m.viewChatModel.notifications {
+		text := fmt.Sprintf("Invite to #%s (%d)", n.label, n.count)
+		if n.count <= 1 {
+			text = fmt.Sprintf("Invite to #%s", n.label)
+		}
+		msgs = append(msgs, chatMsg{
+			sender:  m.app.config.BotUsername,
+			text:    text,
+			time:    time.Now(),
+			channel: "notifications",
+		})
+	}
+	return msgs
+}
+
+func calculateNotificationTotal(notifs []userNotification) int {
+	total := 0
+	for _, notif := range notifs {
+		if notif.count > 0 {
+			total += notif.count
+		} else {
+			total++
+		}
+	}
+	return total
+}
+
+func notificationBadgeText(n int) string {
+	if n <= 0 {
+		return ""
+	}
+	if n > 9 {
+		return "9+"
+	}
+	return fmt.Sprintf("%d", n)
+}
+
+func showNotifications(m *model) {
+	m.viewChatModel.viewingNotifications = true
+	m.viewChatModel.notificationUnread = 0
+	now := time.Now().UTC()
+	m.viewChatModel.lastNotificationSeenAt = now
+	_, err := gorm.G[User](m.app.db).
+		Where("id = ?", m.viewChatModel.id).
+		Update(context.Background(), "last_notification_seen_at", now)
+	if err != nil {
+		log.Error("Failed to update notification seen", "user", m.viewChatModel.id, "error", err)
+	}
+	m.viewChatModel.messages = buildNotificationMessages(m)
+	updateChatLines(m)
+}
+
+func clearCommandSuggestions(m *model) {
+	m.viewChatModel.commandSuggestions = nil
+	m.viewChatModel.commandSuggestionInput = ""
+	m.viewChatModel.commandSuggestionIndex = 0
+	m.viewChatModel.commandSuggestionScroll = 0
+	m.viewChatModel.commandSuggestionMode = ""
+}
+
+func showCurrentChannel(m *model) {
+	m.viewChatModel.viewingNotifications = false
+	reloadMessagesChannelSwitch(m)
 }
 
 func sendIslebotMessagePermanent(app *app, message string, channel string) {
@@ -885,6 +1129,25 @@ func updatedChatFocus(m *model) {
 		VPDisableScrolling(&m.viewChatModel.messageHistoryViewport)
 		VPDisableScrolling(&m.viewChatModel.userListViewport)
 		VPEnableScrolling(&m.viewChatModel.channelListViewport)
+		if len(m.viewChatModel.channels) > 0 {
+			if m.viewChatModel.currentChannel >= len(m.viewChatModel.channels) {
+				m.viewChatModel.currentChannel = len(m.viewChatModel.channels) - 1
+			}
+			if m.viewChatModel.currentChannel < 0 {
+				m.viewChatModel.currentChannel = 0
+			}
+			if m.viewChatModel.channelListCursor != -1 {
+				m.viewChatModel.channelListCursor = m.viewChatModel.currentChannel
+			}
+		} else {
+			m.viewChatModel.channelListCursor = -1
+		}
+		m.viewChatModel.viewingNotifications = m.viewChatModel.channelListCursor == -1
+		if m.viewChatModel.viewingNotifications {
+			showNotifications(m)
+		} else {
+			showCurrentChannel(m)
+		}
 	}
 	updateChannelList(m)
 }
@@ -964,6 +1227,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			case tea.KeyEnter:
 				if m.viewChatModel.textarea.Value() != "" {
 
+					if m.viewChatModel.viewingNotifications && m.viewChatModel.textarea.Value()[0] != '/' {
+						m.viewChatModel.textarea.Reset()
+						return m, nil
+					}
+
 					if m.viewChatModel.textarea.Value()[0] == '/' {
 
 						commandString := m.viewChatModel.textarea.Value()[1:]
@@ -1022,17 +1290,27 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 			if msg.Type == tea.KeyUp || (msg.Type == tea.KeyRunes && msg.Runes[0] == 'k') {
 				if m.viewChatModel.focus == FocusedBoxChannelList {
-					if m.viewChatModel.currentChannel > 0 {
-						m.viewChatModel.currentChannel--
+					if m.viewChatModel.channelListCursor == 0 {
+						m.viewChatModel.channelListCursor = -1
+						clearCommandSuggestions(&m)
+						showNotifications(&m)
+						updateChannelList(&m)
+
+					} else if m.viewChatModel.channelListCursor > 0 {
+						m.viewChatModel.channelListCursor--
+						m.viewChatModel.currentChannel = m.viewChatModel.channelListCursor
+						clearCommandSuggestions(&m)
+
 						m.app.mu.Lock()
 						m.app.sessions[m.viewChatModel.id].currentChannelId = m.viewChatModel.channels[m.viewChatModel.currentChannel].channelId
 						m.viewChatModel.memberList = m.app.channelMemberListCache[m.viewChatModel.channels[m.viewChatModel.currentChannel].channelId]
 						m.viewChatModel.channels[m.viewChatModel.currentChannel].unread = 0
 						m.app.mu.Unlock()
+						showCurrentChannel(&m)
 						updateChannelList(&m)
 						updateUserList(&m)
-						reloadMessagesChannelSwitch(&m)
 					}
+
 				}
 				// Also allow going up from chat to chat history if your on the first line
 				if m.viewChatModel.focus == FocusedBoxChatInput && msg.Type == tea.KeyUp && m.viewChatModel.textarea.Line() == 0 {
@@ -1042,18 +1320,37 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			if msg.Type == tea.KeyDown || (msg.Type == tea.KeyRunes && msg.Runes[0] == 'j') {
 				if m.viewChatModel.focus == FocusedBoxChannelList {
-					if m.viewChatModel.currentChannel < len(m.viewChatModel.channels)-1 {
-						m.viewChatModel.currentChannel++
+					if len(m.viewChatModel.channels) == 0 {
+						// Nothing else to navigate
+					} else if m.viewChatModel.channelListCursor == -1 {
+						m.viewChatModel.channelListCursor = 0
+						m.viewChatModel.currentChannel = 0
+						clearCommandSuggestions(&m)
+
 						m.app.mu.Lock()
 						m.app.sessions[m.viewChatModel.id].currentChannelId = m.viewChatModel.channels[m.viewChatModel.currentChannel].channelId
 						m.viewChatModel.memberList = m.app.channelMemberListCache[m.viewChatModel.channels[m.viewChatModel.currentChannel].channelId]
 						m.viewChatModel.channels[m.viewChatModel.currentChannel].unread = 0
 						m.app.mu.Unlock()
+						showCurrentChannel(&m)
 						updateChannelList(&m)
 						updateUserList(&m)
-						reloadMessagesChannelSwitch(&m)
+					} else if m.viewChatModel.channelListCursor < len(m.viewChatModel.channels)-1 {
+						m.viewChatModel.channelListCursor++
+						m.viewChatModel.currentChannel = m.viewChatModel.channelListCursor
+						clearCommandSuggestions(&m)
+
+						m.app.mu.Lock()
+						m.app.sessions[m.viewChatModel.id].currentChannelId = m.viewChatModel.channels[m.viewChatModel.currentChannel].channelId
+						m.viewChatModel.memberList = m.app.channelMemberListCache[m.viewChatModel.channels[m.viewChatModel.currentChannel].channelId]
+						m.viewChatModel.channels[m.viewChatModel.currentChannel].unread = 0
+						m.app.mu.Unlock()
+						showCurrentChannel(&m)
+						updateChannelList(&m)
+						updateUserList(&m)
 
 					}
+
 				}
 
 				// Also allow going down from view history to chat if your at the bottom
@@ -1120,8 +1417,32 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			updateUserList(&m)
 
 		case chatMsg:
+			if m.viewChatModel.viewingNotifications {
+				if strings.Contains(msg.text, "@"+m.viewChatModel.id) {
+					beepCmd = beep()
+				}
+				for i, v := range m.viewChatModel.channels {
+					if v.channelId == msg.channel {
+						m.viewChatModel.channels[i].unread++
+					}
+				}
+				updateChannelList(&m)
+				m.viewChatModel.messages = buildNotificationMessages(&m)
+				updateChatLines(&m)
+				break
+			}
 			if msg.channel == m.viewChatModel.channels[m.viewChatModel.currentChannel].channelId {
-				m.viewChatModel.messages = append(m.viewChatModel.messages, msg)
+				alreadyPresent := false
+				for i := len(m.viewChatModel.messages) - 1; i >= 0 && i >= len(m.viewChatModel.messages)-10; i-- {
+					prev := m.viewChatModel.messages[i]
+					if prev.channel == msg.channel && prev.sender == msg.sender && prev.text == msg.text && prev.time.Equal(msg.time) {
+						alreadyPresent = true
+						break
+					}
+				}
+				if !alreadyPresent {
+					m.viewChatModel.messages = append(m.viewChatModel.messages, msg)
+				}
 				if strings.Contains(msg.text, "@"+m.viewChatModel.id) {
 					beepCmd = beep()
 				}
@@ -1136,6 +1457,24 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			updateChatLines(&m)
 		case channelList:
 			m.viewChatModel.channels = msg.channels
+			if len(m.viewChatModel.channels) == 0 {
+				m.viewChatModel.currentChannel = 0
+				m.viewChatModel.channelListCursor = -1
+			} else {
+				if m.viewChatModel.currentChannel >= len(m.viewChatModel.channels) {
+					m.viewChatModel.currentChannel = len(m.viewChatModel.channels) - 1
+				}
+				if m.viewChatModel.currentChannel < 0 {
+					m.viewChatModel.currentChannel = 0
+				}
+				if m.viewChatModel.channelListCursor < -1 || m.viewChatModel.channelListCursor >= len(m.viewChatModel.channels) {
+					m.viewChatModel.channelListCursor = m.viewChatModel.currentChannel
+				}
+				if m.viewChatModel.channelListCursor >= 0 {
+					m.viewChatModel.viewingNotifications = false
+					m.viewChatModel.channels[m.viewChatModel.currentChannel].unread = 0
+				}
+			}
 			if msg.firstjoin {
 				sendIslebotMessagePermanent(m.app, fmt.Sprintf("A new user joined for the first time! Welcome @%s. Run /help for information. Your timezone was set to %s, change it with /tz", m.viewChatModel.id, m.viewChatModel.timezone.String()), "global")
 
@@ -1145,6 +1484,18 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case channelMemberListMsg:
 			m.viewChatModel.memberList = msg
 			updateUserList(&m)
+
+		case notificationUpdate:
+			m.viewChatModel.notifications = msg.notifications
+			m.viewChatModel.notificationUnread = msg.unread
+			if m.viewChatModel.viewingNotifications {
+				m.viewChatModel.notificationUnread = 0
+			}
+			updateChannelList(&m)
+			if m.viewChatModel.viewingNotifications {
+				m.viewChatModel.messages = buildNotificationMessages(&m)
+				updateChatLines(&m)
+			}
 
 		case removedFromChannelMsg:
 			removedChannel := string(msg)
@@ -1174,6 +1525,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					}
 				}
 			}
+			m.viewChatModel.channelListCursor = m.viewChatModel.currentChannel
 
 			updateChannelList(&m)
 			updateUserList(&m)
@@ -1243,10 +1595,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						tz := m.app.sessions[m.viewChatModel.id].inferredTimezone
 
 						err = gorm.G[User](m.db).Create(context.Background(), &User{
-							ID:       newUsername,
-							Password: hashedPass,
-							Channels: []Channel{*m.app.channels["global"]},
-							Timezone: tz.String(),
+							ID:                     newUsername,
+							Password:               hashedPass,
+							Channels:               []Channel{*m.app.channels["global"]},
+							Timezone:               tz.String(),
+							LastLoginAt:            time.Now().UTC(),
+							LastSeenAt:             time.Now().UTC(),
+							LastNotificationSeenAt: time.Now().UTC(),
 						})
 
 						if err != nil {
@@ -1271,8 +1626,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 							m.app.sessionUsernames[m.viewChatModel.id] = newUsername
 							m.app.mu.Unlock()
 							m.viewChatModel.id = newUsername
+							m.viewChatModel.lastSeenAt = time.Now().UTC()
 							// Add user to global channel
 							addUserToChannel(m.app, newUsername, "global")
+							refreshNotifications(m.app, newUsername)
 							m.viewMode = viewChat
 							m.viewChatModel.timezone = tz
 							return m, tea.Batch(

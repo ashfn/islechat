@@ -16,10 +16,13 @@ import (
 // Database models
 type User struct {
 	gorm.Model
-	ID       string `gorm:"primaryKey"`
-	Password string
-	Channels []Channel `gorm:"many2many:user_channels;"`
-	Timezone string    `gorm:"default:UTC"`
+	ID                     string `gorm:"primaryKey"`
+	Password               string
+	Channels               []Channel `gorm:"many2many:user_channels;"`
+	Timezone               string    `gorm:"default:UTC"`
+	LastLoginAt            time.Time
+	LastSeenAt             time.Time
+	LastNotificationSeenAt time.Time
 }
 
 type Message struct {
@@ -36,7 +39,8 @@ type Invite struct {
 	User      User
 	UserID    string `gorm:"primaryKey"`
 	Channel   Channel
-	ChannelID string `gorm:"primaryKey"`
+	ChannelID string    `gorm:"primaryKey"`
+	CreatedAt time.Time `gorm:"autoCreateTime"`
 }
 
 type Channel struct {
@@ -156,6 +160,14 @@ type userChannelState struct {
 	unread    int
 }
 
+// Notification state
+type userNotification struct {
+	id    string
+	label string
+	count int
+	kind  string
+}
+
 // View models
 type viewRegistrationModel struct {
 	FocusedBox           RegistrationFocusedBox
@@ -173,6 +185,7 @@ type viewChatModel struct {
 	messages                []chatMsg
 	channels                []userChannelState
 	currentChannel          int
+	channelListCursor       int
 	channelBanner           string
 	id                      string
 	textarea                textarea.Model
@@ -191,6 +204,11 @@ type viewChatModel struct {
 	commandSuggestionIndex  int
 	commandSuggestionScroll int
 	commandSuggestionMode   string
+	notifications           []userNotification
+	notificationUnread      int
+	lastNotificationSeenAt  time.Time
+	lastSeenAt              time.Time
+	viewingNotifications    bool
 }
 
 type model struct {
@@ -204,6 +222,11 @@ type model struct {
 type channelList struct {
 	channels  []userChannelState
 	firstjoin bool
+}
+
+type notificationUpdate struct {
+	notifications []userNotification
+	unread        int
 }
 
 // Member list types

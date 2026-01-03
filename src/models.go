@@ -43,6 +43,20 @@ type Invite struct {
 	CreatedAt time.Time `gorm:"autoCreateTime"`
 }
 
+type Notification struct {
+	gorm.Model
+	UserID string `gorm:"index"`
+	Text   string `gorm:"type:text"`
+}
+
+type Ban struct {
+	User      User
+	UserID    string `gorm:"primaryKey"`
+	Channel   Channel
+	ChannelID string    `gorm:"primaryKey"`
+	CreatedAt time.Time `gorm:"autoCreateTime"`
+}
+
 type Channel struct {
 	ID       string
 	Owner    User
@@ -96,6 +110,9 @@ type app struct {
 
 	// Cached channel memberlists
 	channelMemberListCache map[string]*channelMemberList
+
+	// Cached bans per channel
+	bans map[string]map[string]struct{}
 
 	// Map between session ids and logged-in usernames
 	// Used for handling session disconnects

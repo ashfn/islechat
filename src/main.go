@@ -110,6 +110,7 @@ func newApp(db *gorm.DB, config serverConfig) *app {
 	// a.channelMembers = make(map[string]map[string]*userSession)
 	a.sessionUsernames = make(map[string]string)
 	a.channelMemberListCache = make(map[string]*channelMemberList)
+	a.bans = make(map[string]map[string]struct{})
 
 	// channels, err := gorm.G[Channel](db).Find(context.Background())
 	var channels []Channel
@@ -119,6 +120,18 @@ func newApp(db *gorm.DB, config serverConfig) *app {
 
 	if err != nil {
 		log.Errorf("Error fetching channels: %v", err)
+	}
+
+	var bans []Ban
+	if banErr := db.Find(&bans).Error; banErr != nil {
+		log.Errorf("Error fetching bans: %v", banErr)
+	} else {
+		for _, b := range bans {
+			if _, ok := a.bans[b.ChannelID]; !ok {
+				a.bans[b.ChannelID] = make(map[string]struct{})
+			}
+			a.bans[b.ChannelID][b.UserID] = struct{}{}
+		}
 	}
 
 	for _, v := range channels {
@@ -446,7 +459,7 @@ func main() {
 		panic("failed to connect database")
 	}
 
-	db.AutoMigrate(&Message{}, &Channel{}, &User{}, &Invite{})
+	db.AutoMigrate(&Message{}, &Channel{}, &User{}, &Invite{}, &Notification{}, &Ban{})
 
 	db.Clauses(clause.OnConflict{DoNothing: true}).Create(&[]User{
 		{
@@ -536,6 +549,9 @@ func joinedHandleChannels(m *model) []userChannelState {
 
 	// Adding the channels for the user
 	for _, channel := range joinedChannelIDs {
+		if isUserBannedFromChannel(m.app, m.viewChatModel.id, channel) {
+			continue
+		}
 		if channel != "global" {
 			channels = append(channels, userChannelState{
 				channelId: channel,
@@ -547,6 +563,9 @@ func joinedHandleChannels(m *model) []userChannelState {
 	uniqueChannelIDs := []string{"global"}
 	seen := map[string]struct{}{"global": struct{}{}}
 	for _, channel := range joinedChannelIDs {
+		if isUserBannedFromChannel(m.app, m.viewChatModel.id, channel) {
+			continue
+		}
 		if _, ok := seen[channel]; ok {
 			continue
 		}
@@ -671,16 +690,28 @@ func refreshNotifications(app *app, userID string) {
 	}
 
 	var unreadInvites int64
+	var unreadNotifications int64
 	if dbUser.LastNotificationSeenAt.IsZero() {
 		// No record of having seen notifications yet.
 		err = app.db.Model(&Invite{}).
 			Where("user_id = ?", userID).
 			Count(&unreadInvites).Error
+		if err == nil {
+			err = app.db.Model(&Notification{}).
+				Where("user_id = ?", userID).
+				Count(&unreadNotifications).Error
+		}
 	} else {
 		err = app.db.Model(&Invite{}).
 			Where("user_id = ?", userID).
 			Where("created_at > ?", dbUser.LastNotificationSeenAt).
 			Count(&unreadInvites).Error
+		if err == nil {
+			err = app.db.Model(&Notification{}).
+				Where("user_id = ?", userID).
+				Where("created_at > ?", dbUser.LastNotificationSeenAt).
+				Count(&unreadNotifications).Error
+		}
 	}
 	if err != nil {
 		log.Error("Failed to calculate notification unread", "user", userID, "error", err)
@@ -694,7 +725,7 @@ func refreshNotifications(app *app, userID string) {
 		return
 	}
 
-	go session.prog.Send(notificationUpdate{notifications: notifications, unread: int(unreadInvites)})
+	go session.prog.Send(notificationUpdate{notifications: notifications, unread: int(unreadInvites + unreadNotifications)})
 }
 
 func initialModel(a *app, width int, height int, sess ssh.Session) model {
@@ -908,6 +939,46 @@ func removeUserFromChannel(app *app, user string, channel string) bool {
 	return true
 }
 
+func isUserBannedFromChannel(app *app, userID, channelID string) bool {
+	if app == nil || userID == "" || channelID == "" {
+		return false
+	}
+	app.mu.RLock()
+	defer app.mu.RUnlock()
+	channelBans, ok := app.bans[channelID]
+	if !ok {
+		return false
+	}
+	_, banned := channelBans[userID]
+	return banned
+}
+
+func addBanToCache(app *app, userID, channelID string) {
+	if app == nil || userID == "" || channelID == "" {
+		return
+	}
+	app.mu.Lock()
+	defer app.mu.Unlock()
+	if _, ok := app.bans[channelID]; !ok {
+		app.bans[channelID] = make(map[string]struct{})
+	}
+	app.bans[channelID][userID] = struct{}{}
+}
+
+func removeBanFromCache(app *app, userID, channelID string) {
+	if app == nil || userID == "" || channelID == "" {
+		return
+	}
+	app.mu.Lock()
+	defer app.mu.Unlock()
+	if channelBans, ok := app.bans[channelID]; ok {
+		delete(channelBans, userID)
+		if len(channelBans) == 0 {
+			delete(app.bans, channelID)
+		}
+	}
+}
+
 func updateRegistrationTextFocuses(m *model) {
 	switch m.viewRegistrationModel.FocusedBox {
 	case RegistrationUsernameFocused:
@@ -979,6 +1050,12 @@ func updateChannelMemberList(params updateChannelMemberListParameters) {
 					params.app.channelMemberListCache[params.channelId].offlineMembers[params.userId] = params.userId
 				}
 			}
+			if params.change == UserChannnelLeave {
+				if _, ok := params.app.channelMemberListCache[params.channelId].offlineMembers[params.userId]; ok {
+					delete(params.app.channelMemberListCache[params.channelId].offlineMembers, params.userId)
+					params.app.channelMemberListCache[params.channelId].offlineMemberCount = len(params.app.channelMemberListCache[params.channelId].offlineMembers)
+				}
+			}
 		}
 
 		online := params.app.channelMemberListCache[params.channelId].onlineMembers
@@ -1007,30 +1084,163 @@ func sendIslebotMessage(m *model, msg string) {
 	updateChatLines(m)
 }
 
-func buildNotificationMessages(m *model) []chatMsg {
+func createPersistentNotification(app *app, userID, text string) {
+	if app == nil || userID == "" || text == "" {
+		return
+	}
+
+	n := Notification{UserID: userID, Text: text}
+	err := app.db.WithContext(context.Background()).Create(&n).Error
+	if err != nil {
+		log.Error("Failed to create notification", "user", userID, "error", err)
+		return
+	}
+
+	// If the user is online this will bump the unread badge and, if they are
+	// currently viewing notifications, reload the tab from the DB.
+	refreshNotifications(app, userID)
+}
+
+type dbTime struct{ time.Time }
+
+func (dt *dbTime) Scan(value any) error {
+	if dt == nil {
+		return nil
+	}
+	if value == nil {
+		dt.Time = time.Time{}
+		return nil
+	}
+
+	switch v := value.(type) {
+	case time.Time:
+		dt.Time = v
+		return nil
+	case string:
+		dt.Time = parseDBTimeString(v)
+		return nil
+	case []byte:
+		dt.Time = parseDBTimeString(string(v))
+		return nil
+	default:
+		return fmt.Errorf("unsupported Scan type %T", value)
+	}
+}
+
+func parseDBTimeString(input string) time.Time {
+	input = strings.TrimSpace(input)
+	if input == "" {
+		return time.Time{}
+	}
+
+	layouts := []string{
+		time.RFC3339Nano,
+		time.RFC3339,
+		"2006-01-02 15:04:05.999999999-07:00",
+		"2006-01-02 15:04:05-07:00",
+		"2006-01-02 15:04:05.999999999",
+		"2006-01-02 15:04:05",
+		"2006-01-02T15:04:05.999999999Z07:00",
+		"2006-01-02T15:04:05Z07:00",
+	}
+
+	for _, layout := range layouts {
+		parsed, err := time.Parse(layout, input)
+		if err == nil {
+			return parsed
+		}
+		parsed, err = time.ParseInLocation(layout, input, time.UTC)
+		if err == nil {
+			return parsed
+		}
+	}
+
+	return time.Time{}
+}
+
+func loadNotificationMessages(app *app, userID string) []chatMsg {
+	if app == nil || userID == "" {
+		return nil
+	}
+
 	msgs := make([]chatMsg, 0)
-	if len(m.viewChatModel.notifications) == 0 {
+
+	var persisted []Notification
+	err := app.db.WithContext(context.Background()).
+		Where("user_id = ?", userID).
+		Order("created_at ASC").
+		Limit(200).
+		Find(&persisted).Error
+	if err != nil {
+		log.Error("Failed to load notifications", "user", userID, "error", err)
+	}
+
+	for _, n := range persisted {
 		msgs = append(msgs, chatMsg{
-			sender:  m.app.config.BotUsername,
+			sender:  app.config.BotUsername,
+			text:    n.Text,
+			time:    n.CreatedAt,
+			channel: "notifications",
+		})
+	}
+
+	type inviteRow struct {
+		ChannelID string
+		Count     int64
+		Latest    dbTime `gorm:"column:latest"`
+	}
+
+	var invites []inviteRow
+	err = app.db.WithContext(context.Background()).
+		Table("invites").
+		Select("channel_id, COUNT(*) as count, MAX(created_at) as latest").
+		Where("user_id = ?", userID).
+		Group("channel_id").
+		Order("channel_id ASC").
+		Scan(&invites).Error
+	if err != nil {
+		log.Error("Failed to load invite notifications", "user", userID, "error", err)
+	}
+
+	for _, row := range invites {
+		latest := row.Latest.Time
+		if latest.IsZero() {
+			latest = time.Now()
+		}
+		text := fmt.Sprintf("Invite to #%s (%d) — join with /chan join %s", row.ChannelID, row.Count, row.ChannelID)
+		if row.Count <= 1 {
+			text = fmt.Sprintf("Invite to #%s — join with /chan join %s", row.ChannelID, row.ChannelID)
+		}
+		msgs = append(msgs, chatMsg{
+			sender:  app.config.BotUsername,
+			text:    text,
+			time:    latest,
+			channel: "notifications",
+		})
+	}
+
+	if len(msgs) == 0 {
+		return []chatMsg{{
+			sender:  app.config.BotUsername,
 			text:    "No notifications",
 			time:    time.Now(),
 			channel: "notifications",
-		})
-		return msgs
+		}}
 	}
 
-	for _, n := range m.viewChatModel.notifications {
-		text := fmt.Sprintf("Invite to #%s (%d)", n.label, n.count)
-		if n.count <= 1 {
-			text = fmt.Sprintf("Invite to #%s", n.label)
+	slices.SortFunc(msgs, func(a, b chatMsg) int {
+		if a.time.Before(b.time) {
+			return -1
 		}
-		msgs = append(msgs, chatMsg{
-			sender:  m.app.config.BotUsername,
-			text:    text,
-			time:    time.Now(),
-			channel: "notifications",
-		})
-	}
+		if a.time.After(b.time) {
+			return 1
+		}
+		if a.sender != b.sender {
+			return strings.Compare(a.sender, b.sender)
+		}
+		return strings.Compare(a.text, b.text)
+	})
+
 	return msgs
 }
 
@@ -1067,7 +1277,7 @@ func showNotifications(m *model) {
 	if err != nil {
 		log.Error("Failed to update notification seen", "user", m.viewChatModel.id, "error", err)
 	}
-	m.viewChatModel.messages = buildNotificationMessages(m)
+	m.viewChatModel.messages = loadNotificationMessages(m.app, m.viewChatModel.id)
 	updateChatLines(m)
 }
 
@@ -1421,14 +1631,32 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if strings.Contains(msg.text, "@"+m.viewChatModel.id) {
 					beepCmd = beep()
 				}
+
+				// Notifications tab is a persistent, DB-backed feed. When we receive a
+				// live notification, append it; normal chat messages still increment
+				// unread counts for their channels.
+				if msg.channel == "notifications" {
+					alreadyPresent := false
+					for i := len(m.viewChatModel.messages) - 1; i >= 0 && i >= len(m.viewChatModel.messages)-10; i-- {
+						prev := m.viewChatModel.messages[i]
+						if prev.channel == msg.channel && prev.sender == msg.sender && prev.text == msg.text && prev.time.Equal(msg.time) {
+							alreadyPresent = true
+							break
+						}
+					}
+					if !alreadyPresent {
+						m.viewChatModel.messages = append(m.viewChatModel.messages, msg)
+					}
+					updateChatLines(&m)
+					break
+				}
+
 				for i, v := range m.viewChatModel.channels {
 					if v.channelId == msg.channel {
 						m.viewChatModel.channels[i].unread++
 					}
 				}
 				updateChannelList(&m)
-				m.viewChatModel.messages = buildNotificationMessages(&m)
-				updateChatLines(&m)
 				break
 			}
 			if msg.channel == m.viewChatModel.channels[m.viewChatModel.currentChannel].channelId {
@@ -1490,10 +1718,18 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.viewChatModel.notificationUnread = msg.unread
 			if m.viewChatModel.viewingNotifications {
 				m.viewChatModel.notificationUnread = 0
+				now := time.Now().UTC()
+				m.viewChatModel.lastNotificationSeenAt = now
+				_, err := gorm.G[User](m.app.db).
+					Where("id = ?", m.viewChatModel.id).
+					Update(context.Background(), "last_notification_seen_at", now)
+				if err != nil {
+					log.Error("Failed to update notification seen", "user", m.viewChatModel.id, "error", err)
+				}
 			}
 			updateChannelList(&m)
 			if m.viewChatModel.viewingNotifications {
-				m.viewChatModel.messages = buildNotificationMessages(&m)
+				m.viewChatModel.messages = loadNotificationMessages(m.app, m.viewChatModel.id)
 				updateChatLines(&m)
 			}
 

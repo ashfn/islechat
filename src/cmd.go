@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"slices"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -165,24 +166,13 @@ func mentionSuggestions(m *model, query string) []cmdSuggestion {
 		return nil
 	}
 
-	// In public channels, only online users. In private channels, include offline members too.
+	// Only online users
 	candidates := make(map[string]string) // username -> status
 	for _, sess := range memberList.onlineMembers {
 		if sess == nil || sess.username == "" {
 			continue
 		}
 		candidates[sess.username] = "online"
-	}
-	if !channel.Public {
-		for username := range memberList.offlineMembers {
-			if username == "" {
-				continue
-			}
-			if _, ok := candidates[username]; ok {
-				continue
-			}
-			candidates[username] = "offline"
-		}
 	}
 
 	type scored struct {
@@ -315,6 +305,10 @@ func buildCommandGraph() *cmdNode {
 
 	chanHelp := func(m *model) string {
 		return "Commands:\n" +
+			"/whois <user>\n" +
+			"/chan kick <user>\n" +
+			"/chan ban <user>\n" +
+			"/chan unban <user>\n" +
 			"/chan create <name>\n" +
 			"/chan public\n" +
 			"/chan private\n" +
@@ -344,6 +338,9 @@ func buildCommandGraph() *cmdNode {
 	chanNode.add(&cmdNode{Name: "leave", Desc: "Leave current channel", Run: runChanLeave})
 	chanNode.add(&cmdNode{Name: "banner", Desc: "Set channel banner", ArgHint: "<text>", Run: runChanBanner})
 	chanNode.add(&cmdNode{Name: "delete", Desc: "Delete current channel", Run: runChanDelete})
+	chanNode.add(&cmdNode{Name: "kick", Desc: "Kick user from channel", ArgHint: "<user>", Run: runChanKick})
+	chanNode.add(&cmdNode{Name: "ban", Desc: "Ban user from channel", ArgHint: "<user>", Run: runChanBan})
+	chanNode.add(&cmdNode{Name: "unban", Desc: "Unban user from channel", ArgHint: "<user>", Run: runChanUnban})
 	root.add(chanNode)
 
 	root.add(&cmdNode{
@@ -353,6 +350,8 @@ func buildCommandGraph() *cmdNode {
 			sendIslebotMessage(m, chanHelp(m))
 		},
 	})
+
+	root.add(&cmdNode{Name: "whois", Desc: "Show user info", ArgHint: "<user>", Run: runWhois})
 
 	tzNode := &cmdNode{
 		Name:    "tz",
@@ -486,6 +485,23 @@ func normalizeUserPrefix(prefix string) string {
 	return prefix
 }
 
+func isCurrentChannelOwner(m *model) bool {
+	if m == nil || m.app == nil {
+		return false
+	}
+	m.app.mu.RLock()
+	defer m.app.mu.RUnlock()
+	if m.viewChatModel.currentChannel >= len(m.viewChatModel.channels) {
+		return false
+	}
+	channelID := m.viewChatModel.channels[m.viewChatModel.currentChannel].channelId
+	channel := m.app.channels[channelID]
+	if channel == nil {
+		return false
+	}
+	return channel.OwnerID == m.viewChatModel.id
+}
+
 func userArgSuggestions(m *model, base, prefix string) []cmdSuggestion {
 	prefix = normalizeUserPrefix(prefix)
 	prefixLower := strings.ToLower(prefix)
@@ -493,100 +509,195 @@ func userArgSuggestions(m *model, base, prefix string) []cmdSuggestion {
 	out := make([]cmdSuggestion, 0, 50)
 	seen := make(map[string]struct{})
 
-	// Start with mention-style suggestions for the current channel.
-	for _, s := range mentionSuggestions(m, prefix) {
-		username := strings.TrimPrefix(s.Display, "@")
+	kickBanOnly := strings.HasPrefix(base, "/chan kick") || strings.HasPrefix(base, "/chan ban")
+	unbanOnly := strings.HasPrefix(base, "/chan unban")
+
+	candidatesMap := make(map[string]string)
+	if m != nil && m.app != nil {
+		if kickBanOnly {
+			m.app.mu.RLock()
+			if m.viewChatModel.currentChannel < len(m.viewChatModel.channels) {
+				channelID := m.viewChatModel.channels[m.viewChatModel.currentChannel].channelId
+				if ml, ok := m.app.channelMemberListCache[channelID]; ok {
+					for name, sess := range ml.onlineMembers {
+						if sess == nil || name == "" {
+							continue
+						}
+						candidatesMap[name] = "Online"
+					}
+					for name := range ml.offlineMembers {
+						if name == "" {
+							continue
+						}
+						if _, exists := candidatesMap[name]; !exists {
+							candidatesMap[name] = "Offline"
+						}
+					}
+				}
+				var members []string
+				_ = m.app.db.WithContext(context.Background()).
+					Table("user_channels").
+					Where("channel_id = ?", channelID).
+					Pluck("user_id", &members).Error
+				for _, name := range members {
+					if name == "" {
+						continue
+					}
+					if _, exists := candidatesMap[name]; !exists {
+						candidatesMap[name] = "Offline"
+					}
+				}
+			}
+			m.app.mu.RUnlock()
+		} else if unbanOnly {
+			m.app.mu.RLock()
+			if m.viewChatModel.currentChannel < len(m.viewChatModel.channels) {
+				channelID := m.viewChatModel.channels[m.viewChatModel.currentChannel].channelId
+				var banned []string
+				_ = m.app.db.WithContext(context.Background()).
+					Table("bans").
+					Where("channel_id = ?", channelID).
+					Pluck("user_id", &banned).Error
+				for _, name := range banned {
+					if name == "" {
+						continue
+					}
+					if sess, ok := m.app.sessions[name]; ok && sess != nil && sess.loggedIn {
+						candidatesMap[name] = "Banned (online)"
+					} else {
+						candidatesMap[name] = "Banned"
+					}
+				}
+			}
+			m.app.mu.RUnlock()
+		} else {
+			m.app.mu.RLock()
+			for name, sess := range m.app.sessions {
+				if sess == nil || !sess.loggedIn || name == "" {
+					continue
+				}
+				candidatesMap[name] = "Online"
+			}
+			m.app.mu.RUnlock()
+		}
+	}
+
+	candidates := make([]string, 0, len(candidatesMap))
+	for name := range candidatesMap {
+		candidates = append(candidates, name)
+	}
+	sort.Strings(candidates)
+
+	for _, username := range candidates {
+		lower := strings.ToLower(username)
+		if prefixLower != "" {
+			if strings.HasPrefix(lower, prefixLower) {
+				// keep
+			} else if strings.Contains(lower, prefixLower) {
+				// keep
+			} else {
+				continue
+			}
+		}
 		cmd := base + " " + username
 		if _, ok := seen[cmd]; ok {
 			continue
 		}
 		seen[cmd] = struct{}{}
-		out = append(out, cmdSuggestion{Display: cmd, Insert: cmd, Desc: s.Desc})
-		if len(out) >= 50 {
-			return out
+		desc := candidatesMap[username]
+		if desc == "" {
+			desc = "User"
 		}
-	}
-
-	if m == nil || m.app == nil || m.app.db == nil {
-		return out
-	}
-
-	type scored struct {
-		name  string
-		score int
-	}
-
-	candidates := make([]scored, 0)
-
-	// If no prefix, show online users first.
-	if prefixLower == "" {
-		m.app.mu.RLock()
-		for username, sess := range m.app.sessions {
-			if sess == nil || !sess.loggedIn || username == "" {
-				continue
-			}
-			candidates = append(candidates, scored{name: username, score: 0})
-		}
-		m.app.mu.RUnlock()
-	}
-
-	// Pull matching users from the DB. Case-insensitive filtering.
-	// We keep results bounded and rank in Go.
-	var ids []string
-	like := "%"
-	if prefixLower != "" {
-		like = "%" + prefixLower + "%"
-	}
-	_ = m.app.db.WithContext(context.Background()).
-		Model(&User{}).
-		Select("id").
-		Where("LOWER(id) LIKE ?", like).
-		Order("id ASC").
-		Limit(200).
-		Pluck("id", &ids).Error
-
-	for _, username := range ids {
-		lower := strings.ToLower(username)
-		score := 0
-		if prefixLower != "" {
-			switch {
-			case strings.HasPrefix(lower, prefixLower):
-				score = 0
-			case strings.Contains(lower, prefixLower):
-				score = 1
-			default:
-				continue
-			}
-		}
-		candidates = append(candidates, scored{name: username, score: score})
-	}
-
-	slices.SortFunc(candidates, func(a, b scored) int {
-		if a.score != b.score {
-			return a.score - b.score
-		}
-		return strings.Compare(a.name, b.name)
-	})
-
-	for _, cand := range candidates {
-		cmd := base + " " + cand.name
-		if _, ok := seen[cmd]; ok {
-			continue
-		}
-		seen[cmd] = struct{}{}
-
-		desc := "User"
-		m.app.mu.RLock()
-		sess, ok := m.app.sessions[cand.name]
-		m.app.mu.RUnlock()
-		if ok && sess != nil && sess.loggedIn {
-			desc = "Online"
-		}
-
 		out = append(out, cmdSuggestion{Display: cmd, Insert: cmd, Desc: desc})
 		if len(out) >= 50 {
 			break
 		}
+	}
+
+	return out
+}
+
+func joinChannelSuggestions(m *model, base, prefix string) []cmdSuggestion {
+	prefix = strings.TrimSpace(prefix)
+	prefixLower := strings.ToLower(prefix)
+
+	joined := make(map[string]struct{})
+	if m != nil {
+		for _, ch := range m.viewChatModel.channels {
+			if ch.channelId == "" {
+				continue
+			}
+			joined[ch.channelId] = struct{}{}
+		}
+	}
+
+	seen := make(map[string]struct{})
+	out := make([]cmdSuggestion, 0, 50)
+
+	add := func(channelID, desc string) {
+		if channelID == "" {
+			return
+		}
+		lower := strings.ToLower(channelID)
+		if prefixLower != "" {
+			if !strings.HasPrefix(lower, prefixLower) && !strings.Contains(lower, prefixLower) {
+				return
+			}
+		}
+		if _, ok := joined[channelID]; ok {
+			return
+		}
+		if m != nil && m.app != nil {
+			if isUserBannedFromChannel(m.app, m.viewChatModel.id, channelID) {
+				return
+			}
+		}
+		cmd := base + " " + channelID
+		if _, ok := seen[cmd]; ok {
+			return
+		}
+		seen[cmd] = struct{}{}
+		out = append(out, cmdSuggestion{Display: cmd, Insert: cmd, Desc: desc})
+	}
+
+	// Suggested channels you're invited to.
+	if m != nil && m.app != nil {
+		var invited []string
+		_ = m.app.db.WithContext(context.Background()).
+			Table("invites").
+			Where("user_id = ?", m.viewChatModel.id).
+			Pluck("channel_id", &invited).Error
+		slices.Sort(invited)
+		for _, id := range invited {
+			add(id, "Invited")
+			if len(out) >= 50 {
+				return out
+			}
+		}
+	}
+
+	// Public channels (handy to discover).
+	if m != nil && m.app != nil {
+		public := make([]string, 0)
+		m.app.mu.RLock()
+		for id, ch := range m.app.channels {
+			if ch == nil || !ch.Public {
+				continue
+			}
+			public = append(public, id)
+		}
+		m.app.mu.RUnlock()
+		slices.Sort(public)
+		for _, id := range public {
+			add(id, "Public")
+			if len(out) >= 50 {
+				return out
+			}
+		}
+	}
+
+	if len(out) > 50 {
+		out = out[:50]
 	}
 
 	return out
@@ -601,7 +712,7 @@ func suggestCommands(m *model, input string) []cmdSuggestion {
 		tokens = append(tokens, "")
 	}
 	if len(tokens) == 0 {
-		return suggestionsForChildren(rootCommands, nil, "")
+		return suggestionsForChildren(m, rootCommands, nil, "")
 	}
 
 	node := rootCommands
@@ -647,6 +758,9 @@ func suggestCommands(m *model, input string) []cmdSuggestion {
 				if node.Name == "tz" {
 					return timezoneSuggestions(m, base, "")
 				}
+				if node.Name == "join" {
+					return joinChannelSuggestions(m, base, "")
+				}
 				if node.ArgHint == "<user>" {
 					return userArgSuggestions(m, base, "")
 				}
@@ -654,7 +768,7 @@ func suggestCommands(m *model, input string) []cmdSuggestion {
 				insert := base + " "
 				return []cmdSuggestion{{Display: display, Insert: insert, Desc: node.Desc}}
 			}
-			return suggestionsForChildren(node, path, "")
+			return suggestionsForChildren(m, node, path, "")
 		}
 
 		// If this token exactly matches a child and that child has children,
@@ -662,14 +776,15 @@ func suggestCommands(m *model, input string) []cmdSuggestion {
 		if child, ok := node.match(tok); ok {
 			if strings.EqualFold(tok, child.Name) {
 				if len(child.Children) > 0 {
-					return suggestionsForChildren(child, append(path, child.Name), "")
+					return suggestionsForChildren(m, child, append(path, child.Name), "")
 				}
 				return nil
+
 			}
 			for _, a := range child.Aliases {
 				if strings.EqualFold(tok, a) {
 					if len(child.Children) > 0 {
-						return suggestionsForChildren(child, append(path, child.Name), "")
+						return suggestionsForChildren(m, child, append(path, child.Name), "")
 					}
 					return nil
 				}
@@ -682,6 +797,9 @@ func suggestCommands(m *model, input string) []cmdSuggestion {
 			if node.Name == "tz" {
 				return timezoneSuggestions(m, base, tok)
 			}
+			if node.Name == "join" {
+				return joinChannelSuggestions(m, base, tok)
+			}
 			if node.ArgHint == "<user>" {
 				return userArgSuggestions(m, base, tok)
 			}
@@ -689,13 +807,13 @@ func suggestCommands(m *model, input string) []cmdSuggestion {
 			return []cmdSuggestion{{Display: display, Insert: display, Desc: node.Desc}}
 		}
 
-		return suggestionsForChildren(node, path, tok)
+		return suggestionsForChildren(m, node, path, tok)
 	}
 
 	return nil
 }
 
-func suggestionsForChildren(node *cmdNode, path []string, prefix string) []cmdSuggestion {
+func suggestionsForChildren(m *model, node *cmdNode, path []string, prefix string) []cmdSuggestion {
 	if node == nil || len(node.Children) == 0 {
 		return nil
 	}
@@ -704,6 +822,10 @@ func suggestionsForChildren(node *cmdNode, path []string, prefix string) []cmdSu
 	out := make([]cmdSuggestion, 0, len(children))
 	seen := make(map[string]struct{}, len(children))
 	for _, child := range children {
+		if (child.Name == "kick" || child.Name == "ban" || child.Name == "unban") && !isCurrentChannelOwner(m) {
+			continue
+		}
+
 		full := append([]string{}, path...)
 		full = append(full, child.Name)
 		cmd := "/" + strings.Join(full, " ")
@@ -818,6 +940,11 @@ func runChanJoin(m *model, args []string) {
 		return
 	}
 
+	if isUserBannedFromChannel(m.app, m.viewChatModel.id, channelName) {
+		sendIslebotMessage(m, fmt.Sprintf("You are banned from #%s", channelName))
+		return
+	}
+
 	userId := m.viewChatModel.id
 	if channel.Public {
 		m.app.mu.RLock()
@@ -910,6 +1037,11 @@ func runChanInvite(m *model, args []string) {
 		First(context.Background())
 	if err != nil {
 		sendIslebotMessage(m, fmt.Sprintf("No user could be found: @%s", targetUser))
+		return
+	}
+
+	if isUserBannedFromChannel(m.app, targetUser, channel.ID) {
+		sendIslebotMessage(m, fmt.Sprintf("The user @%s is banned from #%s", targetUser, channel.ID))
 		return
 	}
 
@@ -1238,8 +1370,16 @@ func runChanDelete(m *model, args []string) {
 		refreshNotifications(m.app, userID)
 	}
 
+	_, banDelErr := gorm.G[Ban](m.db).
+		Where("channel_id = ?", channel.ID).
+		Delete(context.Background())
+	if banDelErr != nil {
+		log.Error("Failed to delete bans for channel", "channel", channel.ID, "error", banDelErr)
+	}
+
 	m.app.mu.Lock()
 	delete(m.app.channels, channel.ID)
+	delete(m.app.bans, channel.ID)
 	m.app.mu.Unlock()
 
 	_, err = gorm.G[Channel](m.db).
@@ -1248,6 +1388,336 @@ func runChanDelete(m *model, args []string) {
 	if err != nil {
 		fmt.Errorf("Error whilst deleting channel %s", err)
 	}
+}
+
+func formatDurationShort(d time.Duration) string {
+	if d < 0 {
+		d = -d
+	}
+	if d < time.Minute {
+		return "just now"
+	}
+
+	units := []struct {
+		dur  time.Duration
+		name string
+	}{
+		{24 * time.Hour, "d"},
+		{time.Hour, "h"},
+		{time.Minute, "m"},
+	}
+
+	parts := make([]string, 0, 2)
+	for _, u := range units {
+		if d >= u.dur {
+			val := d / u.dur
+			parts = append(parts, fmt.Sprintf("%d%s", val, u.name))
+			d -= val * u.dur
+		}
+		if len(parts) >= 2 {
+			break
+		}
+	}
+
+	if len(parts) == 0 {
+		return "less than a minute"
+	}
+
+	return strings.Join(parts, " ")
+}
+
+func mutualChannels(m *model, targetUser string) ([]string, error) {
+	if m == nil || m.app == nil {
+		return nil, fmt.Errorf("missing app state")
+	}
+
+	current := make(map[string]struct{}, len(m.viewChatModel.channels))
+	for _, ch := range m.viewChatModel.channels {
+		current[ch.channelId] = struct{}{}
+	}
+
+	var targetChannelIDs []string
+	err := m.app.db.WithContext(context.Background()).
+		Table("user_channels").
+		Where("user_id = ?", targetUser).
+		Pluck("channel_id", &targetChannelIDs).Error
+	if err != nil {
+		return nil, err
+	}
+
+	seen := make(map[string]struct{})
+	mutual := make([]string, 0)
+	for _, ch := range targetChannelIDs {
+		if _, ok := current[ch]; !ok {
+			continue
+		}
+		if _, dup := seen[ch]; dup {
+			continue
+		}
+		seen[ch] = struct{}{}
+		mutual = append(mutual, ch)
+	}
+
+	slices.Sort(mutual)
+	return mutual, nil
+}
+
+func removeMemberAndNotify(m *model, channelID, targetUser, notification string) bool {
+	if m == nil || m.app == nil {
+		return false
+	}
+
+	if ok := removeUserFromChannel(m.app, targetUser, channelID); !ok {
+		return false
+	}
+
+	updateChannelMemberList(updateChannelMemberListParameters{
+		app:       m.app,
+		userId:    targetUser,
+		change:    UserChannnelLeave,
+		channelId: channelID,
+	})
+
+	if notification != "" {
+		createPersistentNotification(m.app, targetUser, notification)
+	}
+
+	var sessionCopy *userSession
+	m.app.mu.Lock()
+	if sess, ok := m.app.sessions[targetUser]; ok && sess != nil {
+		if sess.currentChannelId == channelID {
+			sess.currentChannelId = "global"
+		}
+		sessionCopy = sess
+	}
+	m.app.mu.Unlock()
+
+	if sessionCopy != nil && sessionCopy.loggedIn {
+		sessionCopy.prog.Send(removedFromChannelMsg(channelID))
+	}
+
+	return true
+}
+
+func runWhois(m *model, args []string) {
+	if len(args) != 1 {
+		sendIslebotMessage(m, "Usage: /whois <user>")
+		return
+	}
+
+	targetUser := normalizeUserPrefix(args[0])
+	if targetUser == "" {
+		sendIslebotMessage(m, "Usage: /whois <user>")
+		return
+	}
+
+	user, err := gorm.G[User](m.db).
+		Where("ID = ?", targetUser).
+		First(context.Background())
+	if err != nil {
+		sendIslebotMessage(m, fmt.Sprintf("No user could be found: @%s", targetUser))
+		return
+	}
+
+	m.app.mu.RLock()
+	session, ok := m.app.sessions[targetUser]
+	m.app.mu.RUnlock()
+	online := ok && session != nil && session.loggedIn
+
+	statusText := "Offline"
+	lastOnline := user.LastSeenAt
+	if lastOnline.IsZero() {
+		lastOnline = user.LastLoginAt
+	}
+	lastOnlineText := "No activity recorded"
+
+	if online {
+		statusText = "Online"
+		lastOnlineText = "just now"
+	} else if !lastOnline.IsZero() {
+		ago := formatDurationShort(time.Since(lastOnline))
+		lastOnlineText = fmt.Sprintf("%s (%s ago)", lastOnline.In(m.viewChatModel.timezone).Format("2006-01-02 15:04 MST"), ago)
+	}
+
+	mutual, mutualErr := mutualChannels(m, targetUser)
+	if mutualErr != nil {
+		log.Error("Failed to load mutual channels", "user", targetUser, "error", mutualErr)
+		sendIslebotMessage(m, "Couldn't load mutual channels right now")
+		return
+	}
+	mutualText := "none"
+	if len(mutual) > 0 {
+		mutualText = "#" + strings.Join(mutual, ", #")
+	}
+
+	msg := fmt.Sprintf("User: @%s\nStatus: %s\nLast online: %s\nMutual channels: %s", targetUser, statusText, lastOnlineText, mutualText)
+	sendIslebotMessage(m, msg)
+}
+
+func runChanKick(m *model, args []string) {
+	if len(args) != 1 {
+		sendIslebotMessage(m, "Usage: /chan kick <user>")
+		return
+	}
+	targetUser := normalizeUserPrefix(args[0])
+	if targetUser == "" {
+		sendIslebotMessage(m, "Usage: /chan kick <user>")
+		return
+	}
+
+	m.app.mu.RLock()
+	channel := m.app.channels[m.viewChatModel.channels[m.viewChatModel.currentChannel].channelId]
+	m.app.mu.RUnlock()
+	if channel.OwnerID != m.viewChatModel.id {
+		sendIslebotMessage(m, "You are not the owner of this channel")
+		return
+	}
+
+	if targetUser == m.viewChatModel.id || targetUser == channel.OwnerID {
+		sendIslebotMessage(m, "You cannot kick yourself or the channel owner")
+		return
+	}
+	if targetUser == m.app.config.AdminUsername || targetUser == m.app.config.BotUsername {
+		sendIslebotMessage(m, "You cannot kick that user")
+		return
+	}
+
+	_, err := gorm.G[User](m.db).
+		Where("ID = ?", targetUser).
+		First(context.Background())
+	if err != nil {
+		sendIslebotMessage(m, fmt.Sprintf("No user could be found: @%s", targetUser))
+		return
+	}
+
+	var membership int64
+	memberErr := m.db.WithContext(context.Background()).
+		Table("user_channels").
+		Where("user_id = ?", targetUser).
+		Where("channel_id = ?", channel.ID).
+		Count(&membership).Error
+	if memberErr != nil {
+		sendIslebotMessage(m, "Sorry, could not check membership right now")
+		return
+	}
+	if membership == 0 {
+		sendIslebotMessage(m, fmt.Sprintf("@%s is not a member of #%s", targetUser, channel.ID))
+		return
+	}
+
+	notification := fmt.Sprintf("You were kicked from #%s by @%s", channel.ID, m.viewChatModel.id)
+	if !removeMemberAndNotify(m, channel.ID, targetUser, notification) {
+		sendIslebotMessage(m, "Sorry an error occured whilst removing the user")
+		return
+	}
+
+	sendIslebotMessage(m, fmt.Sprintf("@%s was kicked from #%s", targetUser, channel.ID))
+}
+
+func runChanBan(m *model, args []string) {
+	if len(args) != 1 {
+		sendIslebotMessage(m, "Usage: /chan ban <user>")
+		return
+	}
+	targetUser := normalizeUserPrefix(args[0])
+	if targetUser == "" {
+		sendIslebotMessage(m, "Usage: /chan ban <user>")
+		return
+	}
+
+	m.app.mu.RLock()
+	channel := m.app.channels[m.viewChatModel.channels[m.viewChatModel.currentChannel].channelId]
+	m.app.mu.RUnlock()
+	if channel.OwnerID != m.viewChatModel.id {
+		sendIslebotMessage(m, "You are not the owner of this channel")
+		return
+	}
+
+	if targetUser == m.viewChatModel.id || targetUser == channel.OwnerID {
+		sendIslebotMessage(m, "You cannot ban yourself or the channel owner")
+		return
+	}
+	if targetUser == m.app.config.AdminUsername || targetUser == m.app.config.BotUsername {
+		sendIslebotMessage(m, "You cannot ban that user")
+		return
+	}
+
+	if isUserBannedFromChannel(m.app, targetUser, channel.ID) {
+		sendIslebotMessage(m, fmt.Sprintf("@%s is already banned from #%s", targetUser, channel.ID))
+		return
+	}
+
+	_, err := gorm.G[User](m.db).
+		Where("ID = ?", targetUser).
+		First(context.Background())
+	if err != nil {
+		sendIslebotMessage(m, fmt.Sprintf("No user could be found: @%s", targetUser))
+		return
+	}
+
+	banErr := gorm.G[Ban](m.db).Create(context.Background(), &Ban{UserID: targetUser, ChannelID: channel.ID})
+	if banErr != nil {
+		sendIslebotMessage(m, "Sorry but an error occured whilst banning the user")
+		return
+	}
+	addBanToCache(m.app, targetUser, channel.ID)
+
+	_, _ = gorm.G[Invite](m.db).
+		Where("user_id = ?", targetUser).
+		Where("channel_id = ?", channel.ID).
+		Delete(context.Background())
+
+	notification := fmt.Sprintf("You were banned from #%s by @%s", channel.ID, m.viewChatModel.id)
+	if !removeMemberAndNotify(m, channel.ID, targetUser, notification) {
+		removeBanFromCache(m.app, targetUser, channel.ID)
+		_, _ = gorm.G[Ban](m.db).
+			Where("user_id = ?", targetUser).
+			Where("channel_id = ?", channel.ID).
+			Delete(context.Background())
+		sendIslebotMessage(m, "Sorry an error occured whilst removing the user")
+		return
+	}
+
+	sendIslebotMessage(m, fmt.Sprintf("@%s was banned from #%s", targetUser, channel.ID))
+}
+
+func runChanUnban(m *model, args []string) {
+	if len(args) != 1 {
+		sendIslebotMessage(m, "Usage: /chan unban <user>")
+		return
+	}
+	targetUser := normalizeUserPrefix(args[0])
+	if targetUser == "" {
+		sendIslebotMessage(m, "Usage: /chan unban <user>")
+		return
+	}
+
+	m.app.mu.RLock()
+	channel := m.app.channels[m.viewChatModel.channels[m.viewChatModel.currentChannel].channelId]
+	m.app.mu.RUnlock()
+	if channel.OwnerID != m.viewChatModel.id {
+		sendIslebotMessage(m, "You are not the owner of this channel")
+		return
+	}
+
+	if !isUserBannedFromChannel(m.app, targetUser, channel.ID) {
+		sendIslebotMessage(m, fmt.Sprintf("@%s is not banned from #%s", targetUser, channel.ID))
+		return
+	}
+
+	_, err := gorm.G[Ban](m.db).
+		Where("user_id = ?", targetUser).
+		Where("channel_id = ?", channel.ID).
+		Delete(context.Background())
+	if err != nil {
+		sendIslebotMessage(m, "Sorry but an error occured whilst unbanning the user")
+		return
+	}
+	removeBanFromCache(m.app, targetUser, channel.ID)
+
+	createPersistentNotification(m.app, targetUser, fmt.Sprintf("You were unbanned from #%s by @%s", channel.ID, m.viewChatModel.id))
+
+	sendIslebotMessage(m, fmt.Sprintf("@%s was unbanned from #%s", targetUser, channel.ID))
 }
 
 func runTimezone(m *model, args []string) {

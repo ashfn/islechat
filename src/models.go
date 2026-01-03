@@ -1,26 +1,25 @@
 package main
 
 import (
-	"time"
 	"github.com/charmbracelet/bubbles/textarea"
 	"github.com/charmbracelet/bubbles/textinput"
 	"github.com/charmbracelet/bubbles/viewport"
-	"github.com/charmbracelet/lipgloss"
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/ssh"
 	"go.dalton.dog/bubbleup"
 	"gorm.io/gorm"
 	"sync"
-
+	"time"
 )
 
 // Database models
 type User struct {
 	gorm.Model
-	ID       string    `gorm:"primaryKey"`
+	ID       string `gorm:"primaryKey"`
 	Password string
 	Channels []Channel `gorm:"many2many:user_channels;"`
-	Timezone string `gorm:"default:UTC"`
+	Timezone string    `gorm:"default:UTC"`
 }
 
 type Message struct {
@@ -72,26 +71,24 @@ type serverConfig struct {
 	PostgresSSL          string
 }
 
-
 type app struct {
 	*ssh.Server
 
-	config serverConfig
-	db *gorm.DB 
+	config   serverConfig
+	db       *gorm.DB
 	messages map[string][]chatMsg
 
-	// Only stores logged in users to prevent the same user logging in from multiple shells 
-	// Map from username -> session OR 
+	// Only stores logged in users to prevent the same user logging in from multiple shells
+	// Map from username -> session OR
 	//         sessionId -> session (if not logged in)
 
-	// will also include 
+	// will also include
 	sessions map[string]*userSession
 
 	mu sync.RWMutex
 
 	// Map from channel ids to channel object
 	channels map[string]*Channel
-
 
 	// Cached channel memberlists
 	channelMemberListCache map[string]*channelMemberList
@@ -102,7 +99,6 @@ type app struct {
 	sessionUsernames map[string]string
 
 	timezoneEstimator timezoneEstimator
-
 }
 
 // Session types
@@ -171,25 +167,30 @@ type viewRegistrationModel struct {
 }
 
 type viewChatModel struct {
-	messageHistoryViewport viewport.Model
-	userListViewport       viewport.Model
-	channelListViewport    viewport.Model
-	messages               []chatMsg
-	channels               []userChannelState
-	currentChannel         int
-	channelBanner          string
-	id                     string
-	textarea               textarea.Model
-	senderStyle            lipgloss.Style
-	dateStyle              lipgloss.Style
-	err                    error
-	memberList             *channelMemberList
-	focus                  FocusedBox
-	windowHeight           int
-	windowWidth            int
-	alert                  bubbleup.AlertModel
-	timezone *time.Location
-	sidebarsEnabled bool
+	messageHistoryViewport  viewport.Model
+	userListViewport        viewport.Model
+	channelListViewport     viewport.Model
+	messages                []chatMsg
+	channels                []userChannelState
+	currentChannel          int
+	channelBanner           string
+	id                      string
+	textarea                textarea.Model
+	senderStyle             lipgloss.Style
+	dateStyle               lipgloss.Style
+	err                     error
+	memberList              *channelMemberList
+	focus                   FocusedBox
+	windowHeight            int
+	windowWidth             int
+	alert                   bubbleup.AlertModel
+	timezone                *time.Location
+	sidebarsEnabled         bool
+	commandSuggestions      []cmdSuggestion
+	commandSuggestionInput  string
+	commandSuggestionIndex  int
+	commandSuggestionScroll int
+	commandSuggestionMode   string
 }
 
 type model struct {

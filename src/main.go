@@ -39,7 +39,25 @@ import (
 	"gorm.io/gorm/clause"
 
 	"golang.org/x/crypto/bcrypt"
+	gossh "golang.org/x/crypto/ssh"
 )
+
+// withModernKex restricts key exchange to post-quantum and modern elliptic curve
+// algorithms. The x/crypto defaults still advertise diffie-hellman-group14-sha1.
+func withModernKex() ssh.Option {
+	return func(srv *ssh.Server) error {
+		srv.ServerConfigCallback = func(ctx ssh.Context) *gossh.ServerConfig {
+			cfg := &gossh.ServerConfig{}
+			cfg.KeyExchanges = []string{
+				"mlkem768x25519-sha256",
+				"curve25519-sha256",
+				"curve25519-sha256@libssh.org",
+			}
+			return cfg
+		}
+		return nil
+	}
+}
 
 func HashPassword(password string) (string, error) {
 	bytes, err := bcrypt.GenerateFromPassword([]byte(password), 10)
@@ -183,6 +201,7 @@ func newApp(db *gorm.DB, config serverConfig) *app {
 	s, err := wish.NewServer(
 		wish.WithAddress(net.JoinHostPort(a.config.Host, a.config.Port)),
 		wish.WithHostKeyPath(".ssh/id_ed25519"),
+		withModernKex(),
 		wish.WithPasswordAuth(func(ctx ssh.Context, password string) bool {
 			username := ctx.User()
 

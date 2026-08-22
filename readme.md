@@ -1,86 +1,133 @@
 # isle.chat
 
-A ssh powered chat server with public and private (invite-only) channels 
+An SSH-powered chat server with public and invite-only channels, persistent accounts and messages, and a Discord/Slack-style terminal interface.
 
-Each channel has an owner who can change its banner and invite users (anyone can join if its public)
+Try it with:
 
-Demo it with
-`ssh username@isle.chat`
+```bash
+ssh username@isle.chat
+```
 
 ![Screenshot](screenshots/1.png)
 
-This project is very new right now so don't rely on it for anything critical
-
-For now the code is all in one file, `main.go`, but I'm planning on cleaning it up and splitting it up, especially the command logic
-
-Built using the charm bubbletea/wish stack
+Built on the Charm stack: [Wish](https://github.com/charmbracelet/wish) for SSH session handling and [Bubble Tea](https://github.com/charmbracelet/bubbletea) for the terminal UI.
 
 ## Features
-* Users can create their own channels and make them public or private. They can invite users and change the banner (20x10 character) of their channel which shows on the right.
-* Messages and accounts are persistent and stored on the database. SSH in from anywhere with your credentials and catch up with what you've missed
-* Who's online? A member list on the right shows online users and in private channels also shows offline users
-* Discord/slack style interface with channels on the left, chat in the middle and users on the right
-* Channels with new messages show on the channel list on the left with the number of unread messages
-* Set your timezone to see correct dates on messages (Persists across sessions). Timezones are initially set based on your ip
-  
-## For news and help join the discord server: https://discord.gg/q35CTJvngp
+
+**Channels.** Create your own channels and make them public or private. Public channels are open to anyone; private ones are invite-only. Each channel has an owner who can set a 20×10 character banner, manage invites, and kick, ban or unban users.
+
+**Persistence.** Accounts, messages, invites and bans are stored in SQLite or PostgreSQL, so you can SSH in from anywhere with your credentials and pick up where you left off. Passwords are hashed with bcrypt.
+
+**Presence and unread counts.** A member list shows who's online, and private channels also list offline members. Channels with new messages show an unread count in the sidebar.
+
+**Timezones.** Message timestamps render in your local time. Your timezone is guessed from your IP on first connect and can be changed with `/tz`, which persists across sessions.
+
+**Command completion.** Commands are modelled as a tree of nodes, and completion is aware of where you are in it. Mentions complete against online members of the current channel, `/chan kick` and `/chan ban` over users actually in the channel, `/chan unban` over users you've banned, and `/tz` over the system zoneinfo database.
+
+## Commands
+
+| Command | Description |
+| --- | --- |
+| `/help` | Show available commands |
+| `/whois <user>` | Show user info |
+| `/tz <timezone>` | Show or set your timezone (alias: `/timezone`) |
+| `/chan create <name>` | Create a channel |
+| `/chan join <name>` | Join a channel |
+| `/chan leave` | Leave the current channel |
+| `/chan public` | Make the current channel public |
+| `/chan private` | Make the current channel invite-only |
+| `/chan invite <user>` | Invite a user |
+| `/chan uninvite <user>` | Revoke an invite |
+| `/chan kick <user>` | Kick a user from the channel |
+| `/chan ban <user>` | Ban a user from the channel |
+| `/chan unban <user>` | Lift a ban |
+| `/chan banner <text>` | Set the channel banner |
+| `/chan delete` | Delete the current channel |
+
+Channel management commands apply to the channel you're currently in, and are restricted to its owner.
+
+## Layout
+
+```
+src/main.go     server setup, sessions, message routing, shared state
+src/cmd.go      command graph, dispatch and completion
+src/view.go     rendering
+src/models.go   database models and app/session types
+src/geoip.go    IP-based timezone estimation (WIP)
+```
 
 ## Self-hosting
 
-You can either build the binary yourself using `go build` or you can use docker. 
+### Docker
 
 ```bash
-docker run -t -i -p 2222:2222 -e CLICOLOR_FORCE=1 -e COLORTERM=truecolor -e TERM=xterm-256color --tmpfs /tmp -v ./ssh_keys/id_ed25519:/home/islechat/app/.ssh/id_ed25519:ro -v ./config.toml:/home/islechat/config.toml ashfn0/islechat
+docker run -t -i -p 2222:2222 \
+  -e CLICOLOR_FORCE=1 -e COLORTERM=truecolor -e TERM=xterm-256color \
+  --tmpfs /tmp \
+  -v ./ssh_keys/id_ed25519:/home/islechat/app/.ssh/id_ed25519:ro \
+  -v ./config.toml:/home/islechat/config.toml \
+  ashfn0/islechat
 ```
 
-Additonally a docker-compose file is in this repository. The format of the config.toml file is:
+Images are built for `linux/amd64` and `linux/arm64` in CI and pushed to Docker Hub. A `docker-compose.yml` is included if you'd rather run it alongside PostgreSQL.
+
+### Nix
+
+A flake is provided with a package and a dev shell:
 
 ```bash
+nix build          # build the server
+nix develop        # dev shell with the Go toolchain
+```
+
+### From source
+
+```bash
+cd src && go build
+```
+
+### Configuration
+
+Configuration lives in `config.toml`:
+
+```toml
 Host = "0.0.0.0"
 Port = "2222"
-ServerName = "isle.chat" # Name of the server
-AdminUsername = "admin" # Admin's username (Can post in the announcement channel)
-BotUsername = "islebot" # Username of the bot for system messages
-GlobalBanner = "banner" # Banner used for the #global channel
-AnnouncementChannel = "news" # Name of read-only announcement channel
-DefaultBanner = "banner" # Default banner for new channels
-WelcomeMessage = "A new user joined for the first time! Welcome @%s. Run /help for information" # Message sent when a user joins. %s is the username of the user
-FilterPublicMessages = false # Whether or not public messages should be filtered for profanity
-RegistrationHeader = "isle.chat registration   " # Text shown at top of registration page
-DatabaseMode = "sqlite" # Either sqlite or postgres
+ServerName = "isle.chat"          # Name of the server
+AdminUsername = "admin"           # Can post in the announcement channel
+BotUsername = "islebot"           # Username used for system messages
+GlobalBanner = "..."              # Banner shown in #global
+AnnouncementChannel = "news"      # Name of the read-only announcement channel
+DefaultBanner = "..."             # Banner given to new channels
+WelcomeMessage = "A new user joined for the first time! Welcome @%s. Run /help for information"
+FilterPublicMessages = false      # Filter public messages for profanity
+RegistrationHeader = "isle.chat registration   "
+
+DatabaseMode = "sqlite"           # "sqlite" or "postgres"
 PostgresHost = "postgres"
 PostgresUser = "islechat"
-PostgresPassword = "password"
+PostgresPassword = "change-me"
 PostgresDBName = "islechat"
 PostgresPort = "5432"
 PostgresSSL = "disable"
 ```
 
-### SSH key
-SSH key is used from the path: `.ssh/id_ed25519"` (They will be auto created if you dont specify one).
+`%s` in `WelcomeMessage` is replaced with the new user's username.
 
-If you want ip based timezone detection to work you need to download GeoLite2-City.mmdb from the website (You just have to make an account its free) and update it every now and then
+### SSH host key
 
-###  Why use this?
-- Communicate with friends in separated channels
-- Connect from anywhere with your credentials (ssh is installed everywhere)
+The host key is read from `.ssh/id_ed25519`, and generated automatically if it isn't there.
 
-### Commands:
- - /chan create <name>
- - /chan public
- - /chan private
- - /chan invite <user>
- - /chan uninvite <user>
- - /chan join <name>
- - /chan leave
- - /chan banner <text>
- - /tz <timezone>
-### Features I'm working on adding:
-- Support for adding your pubkey for authentication alongside user/pass
-- Better channel ownership and moderation tools, for example having moderators and a simple permissions system
+### IP-based timezones
 
-### Features I'd like to add in the future:
-- Friend requests/direct messages
-- More customization like theming and username colors
-- Connection to external authentication providers, for example LDAP
-- Custom bot/command support 
+Timezone estimation needs `GeoLite2-City.mmdb` in the working directory. It's free from MaxMind but requires an account, and wants updating periodically. Without it the server falls back to UTC and users can still set their timezone with `/tz`.
+
+## Roadmap
+
+- Public key authentication alongside username and password
+- Moderators and a proper permissions system, rather than owner-only
+- Friend requests and direct messages
+- Theming and username colours
+- External authentication providers such as LDAP/OIDC ( I.e. 'Sign in with GitHub')
+- Custom bots and commands
+- Discord compatible webhooks

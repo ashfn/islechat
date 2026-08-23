@@ -1,71 +1,82 @@
 package main
 
 import (
-	"github.com/oschwald/geoip2-golang/v2"
-	"github.com/charmbracelet/ssh"
-	"log"
-	"net/netip"
-	"net"
 	"fmt"
+	"log"
+	"net"
+	"net/netip"
 	"time"
+
+	"github.com/charmbracelet/ssh"
+	"github.com/oschwald/geoip2-golang/v2"
 )
 
 type timezoneEstimator struct {
 	reader *geoip2.Reader
-	available bool
-
 }
 
-
-func (te *timezoneEstimator) setupGeoipDatabase(){
+func (te *timezoneEstimator) setupGeoipDatabase() {
 	db, err := geoip2.Open("GeoLite2-City.mmdb")
-
-	if(err!=nil){
-		te.available = false
-		fmt.Println("Couldn't setup geolite database")
-		return 
+	if err != nil {
+		log.Printf("Couldn't setup GeoLite database: %v", err)
+		return
 	}
 
-	te.available = true
 	te.reader = db
 }
 
-func (te *timezoneEstimator) estimateTimezone(s ssh.Session) *time.Location {
+// Close releases the GeoIP database resources.
+func (te *timezoneEstimator) Close() error {
+	if te.reader == nil {
+		return nil
+	}
 
-	if(!te.available){
+	err := te.reader.Close()
+	te.reader = nil
+	return err
+}
+
+func (te *timezoneEstimator) estimateTimezone(s ssh.Session) *time.Location {
+	if te.reader == nil {
 		return time.UTC
 	}
 
-	stringip, _, err := net.SplitHostPort(s.Context().RemoteAddr().String())
-
-	if (err!=nil){
-		log.Fatal(err)
+	remoteAddr := s.Context().RemoteAddr()
+	if remoteAddr == nil {
+		log.Printf("Couldn't determine remote address")
+		return time.UTC
 	}
 
-	ip, err := netip.ParseAddr(stringip)
+	stringIP, _, err := net.SplitHostPort(remoteAddr.String())
+	if err != nil {
+		log.Printf("Couldn't parse remote address %q: %v", remoteAddr.String(), err)
+		return time.UTC
+	}
 
-	if(err!=nil){
-		log.Fatal(err)
+	ip, err := netip.ParseAddr(stringIP)
+	if err != nil {
+		log.Printf("Couldn't parse remote IP %q: %v", stringIP, err)
+		return time.UTC
 	}
 
 	record, err := te.reader.City(ip)
 	if err != nil {
-		log.Fatal(err)
+		log.Printf("Couldn't look up GeoIP data for %s: %v", ip, err)
+		return time.UTC
 	}
 
 	if !record.HasData() {
-		fmt.Printf("No data found for this IP")
+		log.Printf("No GeoIP data found for IP %s", ip)
 		return time.UTC
 	}
 
 	timezone, err := time.LoadLocation(record.Location.TimeZone)
-
-	if(err!=nil){
-		fmt.Printf("Couldn't use timeone %s", record.Location.TimeZone)
+	if err != nil {
+		log.Printf("Couldn't use timezone %q: %v", record.Location.TimeZone, err)
 		return time.UTC
 	}
 
-	fmt.Printf("City: %s", record.City.Names.English)
+	fmt.Printf("City: %s\n", record.City.Names.English)
 
 	return timezone
 }
